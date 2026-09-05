@@ -167,233 +167,7 @@ select_storage() {
     echo "$selected"
 }
 
-# Helper: Configure native DHCP client (systemd-networkd) inside container
-# Debian 13 (Trixie) LXC does not ship with isc-dhcp-client; systemd-networkd provides native DHCPv4 and IPv6 SLAAC
-setup_container_dhcp() {
-    local ctid="$1"
-    echo -e "${YW}[*] Activating native DHCP client (systemd-networkd) inside container ${ctid}...${CL}"
-    
-    # Wait until container init namespace is responsive
-    for _ in {1..15}; do
-        if pct exec "$ctid" -- test -d /etc 2>/dev/null; then
-            break
-        fi
-        sleep 1
-    done
 
-    pct exec "$ctid" -- bash -c '
-        ip link set dev lo up 2>/dev/null || true
-        ip link set dev eth0 up 2>/dev/null || true
-
-        # Write systemd-networkd DHCP configuration
-        mkdir -p /etc/systemd/network
-        cat > /etc/systemd/network/10-eth0.network << "NETEOF"
-[Match]
-Name=eth0
-
-[Network]
-DHCP=yes
-IPv6AcceptRA=yes
-
-[DHCPv4]
-UseDNS=yes
-UseRoutes=yes
-NETEOF
-        chmod 644 /etc/systemd/network/10-eth0.network
-
-        # Unmask, enable, and restart systemd-networkd
-        systemctl unmask systemd-networkd 2>/dev/null || true
-        systemctl enable --now systemd-networkd 2>/dev/null || true
-        systemctl restart systemd-networkd 2>/dev/null || true
-
-        if command -v networkctl >/dev/null 2>&1; then
-            networkctl reload 2>/dev/null || true
-            networkctl reconfigure eth0 2>/dev/null || true
-        fi
-
-        # Secondary fallback if legacy dhcp clients are present
-        if command -v dhclient >/dev/null 2>&1; then
-            dhclient -4 -v -1 eth0 2>/dev/null || true
-        elif command -v dhcpcd >/dev/null 2>&1; then
-            dhcpcd -4 eth0 2>/dev/null || true
-        elif command -v udhcpc >/dev/null 2>&1; then
-            udhcpc -i eth0 -n -q 2>/dev/null || true
-        fi
-    ' 2>/dev/null || true
-}
-
-# Helper: Fetch dynamic IPv4 & IPv6 leases from bridge and freeze them as STATIC in Proxmox VE
-freeze_container_network() {
-    local ctid="$1"
-    local bridge="$2"
-    local mode="${3:-DHCP}"
-
-    local ip4_cidr="" gw4="" ip6_cidr="" gw6=""
-    local nameservers searchdomain
-
-    if [[ "$mode" == "STATIC" && -n "${STATIC_IP4:-}" ]]; then
-        ip4_cidr="${STATIC_IP4}"
-        gw4="${STATIC_GW4:-}"
-        nameservers="${STATIC_DNS:-1.1.1.1 8.8.8.8}"
-        echo -e "${GN}[+] Using pre-configured Static IPv4: ${ip4_cidr} (Gateway: ${gw4:-none})${CL}"
-    else
-        echo -e "${YW}[*] Waiting for network lease (IPv4 & IPv6) on bridge '${bridge}'...${CL}"
-        
-        # Wait up to 20s for IPv4 lease
-        for i in {1..20}; do
-            ip4_cidr=$(pct exec "$ctid" -- ip -4 -o addr show dev eth0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)
-            if [[ -n "$ip4_cidr" ]]; then
-                break
-            fi
-            if [[ $i -eq 5 || $i -eq 10 || $i -eq 15 ]]; then
-                pct exec "$ctid" -- bash -c "
-                    ip link set dev eth0 up 2>/dev/null || true
-                    systemctl restart systemd-networkd 2>/dev/null || true
-                    if command -v networkctl >/dev/null 2>&1; then
-                        networkctl reconfigure eth0 2>/dev/null || true
-                    fi
-                " 2>/dev/null || true
-            fi
-            sleep 1
-        done
-
-        # If no DHCP lease was received, bridge may lack a DHCP server
-        if [[ -z "$ip4_cidr" ]]; then
-            echo -e "\n${RD}[!] Container failed to obtain an IPv4 address via DHCP on bridge '${bridge}'!${CL}"
-            echo -e "${YW}[i] This indicates bridge '${bridge}' has no active DHCP server.${CL}"
-
-            local user_ip="" user_gw="" user_dns=""
-            if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
-                if whiptail --backtitle "Proxmox VE Helper Scripts" \
-                    --title "DHCP TIMEOUT ON BRIDGE '${bridge}'" \
-                    --yesno "Container did not receive an IPv4 address from DHCP on bridge '${bridge}'.\n\nWould you like to assign a Static IPv4 address now to continue?" 12 68; then
-                    
-                    user_ip=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
-                        --inputbox "Enter Static IPv4 Address with CIDR prefix (e.g. 192.168.1.50/24 or 10.0.0.50/24):" 9 68 "" \
-                        --title "STATIC IPV4" 3>&1 1>&2 2>&3 || true)
-                    
-                    if [[ -n "$user_ip" ]]; then
-                        user_gw=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
-                            --inputbox "Enter Default Gateway IPv4 (e.g. 192.168.1.1 or 10.0.0.1):" 9 68 "" \
-                            --title "GATEWAY IPV4" 3>&1 1>&2 2>&3 || true)
-                        user_dns=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
-                            --inputbox "Enter DNS Nameservers:" 9 68 "1.1.1.1 8.8.8.8" \
-                            --title "DNS SERVERS" 3>&1 1>&2 2>&3 || echo "1.1.1.1 8.8.8.8")
-                    fi
-                fi
-            else
-                echo -e "${YW}Please provide static IP configuration below:${CL}"
-                read -r -p "Enter Static IPv4 with CIDR prefix (e.g. 192.168.1.50/24): " user_ip || true
-                if [[ -n "$user_ip" ]]; then
-                    read -r -p "Enter Gateway IPv4 (e.g. 192.168.1.1): " user_gw || true
-                    read -r -p "Enter DNS Nameservers [1.1.1.1 8.8.8.8]: " user_dns || true
-                    user_dns="${user_dns:-1.1.1.1 8.8.8.8}"
-                fi
-            fi
-
-            if [[ -n "$user_ip" ]]; then
-                ip4_cidr="$user_ip"
-                gw4="$user_gw"
-                nameservers="${user_dns:-1.1.1.1 8.8.8.8}"
-                echo -e "${GN}[+] Using user-configured Static IPv4: ${ip4_cidr} (Gateway: ${gw4:-none})${CL}"
-            else
-                echo -e "\n${RD}[ERROR] Cannot deploy without an IPv4 address.${CL}"
-                echo -e "${YW}Troubleshooting steps:${CL}"
-                echo -e "  1. Check if a DHCP server is running on bridge '${bridge}'."
-                echo -e "  2. If '${bridge}' is an isolated internal bridge, use Advanced Settings to assign a Static IP or pick your LAN bridge (e.g., vmbr0)."
-                echo -e "  3. To clean up: run 'pct destroy ${ctid}'${CL}\n"
-                exit 1
-            fi
-        fi
-
-        # Give IPv6 SLAAC / DHCPv6 a few seconds
-        for i in {1..6}; do
-            ip6_cidr=$(pct exec "$ctid" -- ip -6 -o addr show dev eth0 scope global 2>/dev/null | grep -v 'tentative' | awk '{print $4}' | head -n1 || true)
-            [[ -n "$ip6_cidr" ]] && break
-            sleep 1
-        done
-
-        if [[ -z "$gw4" ]]; then
-            gw4=$(pct exec "$ctid" -- ip -4 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
-            [[ -z "$gw4" ]] && gw4=$(pct exec "$ctid" -- ip -4 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
-        fi
-
-        gw6=$(pct exec "$ctid" -- ip -6 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
-        [[ -z "$gw6" ]] && gw6=$(pct exec "$ctid" -- ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
-
-        if [[ -z "$nameservers" ]]; then
-            nameservers=$(pct exec "$ctid" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
-            [[ -z "$nameservers" ]] && nameservers="1.1.1.1 8.8.8.8"
-        fi
-        searchdomain=$(pct exec "$ctid" -- awk '/^search/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n1 || true)
-
-        if [[ "$gw6" =~ ^[fF][eE]80: ]]; then
-            echo -e "${YW}[*] Link-local IPv6 gateway (${gw6}) detected; router advertisements (SLAAC) manage default route.${CL}"
-            gw6=""
-        fi
-
-        echo -e "${GN}[+] Acquired IPv4: ${ip4_cidr} (Gateway: ${gw4:-none})${CL}"
-        [[ -n "$ip6_cidr" ]] && echo -e "${GN}[+] Acquired IPv6: ${ip6_cidr} (Gateway: ${gw6:-SLAAC RA})${CL}"
-    fi
-
-    local net_str="name=eth0,bridge=${bridge},firewall=0,ip=${ip4_cidr}"
-    [[ -n "$gw4" ]] && net_str+=",gw=${gw4}"
-    if [[ -n "$ip6_cidr" ]]; then
-        net_str+=",ip6=${ip6_cidr}"
-        [[ -n "$gw6" ]] && net_str+=",gw6=${gw6}"
-    fi
-
-    echo -e "${BL}[*] Locking network lease into STATIC IP configuration in Proxmox VE (pct set)...${CL}"
-    local set_cmd=(pct set "$ctid" -net0 "$net_str" -nameserver "$nameservers")
-    [[ -n "$searchdomain" ]] && set_cmd+=(-searchdomain "$searchdomain")
-    "${set_cmd[@]}" >/dev/null 2>&1 || true
-
-    # Safeguard: Apply live configuration immediately without waiting for reboot
-    pct exec "$ctid" -- bash -c "
-        ip link set dev lo up 2>/dev/null || true
-        ip link set dev eth0 up 2>/dev/null || true
-        ip -4 addr replace '${ip4_cidr}' dev eth0 2>/dev/null || true
-        ${gw4:+ip -4 route replace default via '${gw4}' dev eth0 2>/dev/null || true}
-        ${ip6_cidr:+ip -6 addr replace '${ip6_cidr}' dev eth0 2>/dev/null || true}
-
-        # Write permanent /etc/network/interfaces
-        cat > /etc/network/interfaces << 'IFEOF'
-auto lo
-iface lo inet loopback
-
-auto eth0
-iface eth0 inet static
-    address ${ip4_cidr}
-    ${gw4:+gateway ${gw4}}
-${ip6_cidr:+iface eth0 inet6 static
-    address ${ip6_cidr}}
-IFEOF
-
-        # Write permanent /etc/systemd/network/10-eth0.network
-        mkdir -p /etc/systemd/network
-        cat > /etc/systemd/network/10-eth0.network << 'NETEOF'
-[Match]
-Name=eth0
-
-[Network]
-Address=${ip4_cidr}
-${gw4:+Gateway=${gw4}}
-DNS=${nameservers}
-NETEOF
-
-        # Ensure working nameservers in /etc/resolv.conf
-        mkdir -p /etc
-        > /etc/resolv.conf
-        for ns in ${nameservers}; do
-            echo \"nameserver \$ns\" >> /etc/resolv.conf
-        done
-        ${searchdomain:+echo \"search ${searchdomain}\" >> /etc/resolv.conf}
-    " 2>/dev/null || true
-
-    CT_IP_V4="${ip4_cidr%%/*}"
-    CT_IP_V6="${ip6_cidr%%/*}"
-    CT_IP="${CT_IP_V4}"
-}
 
 clear
 cat << "BANNER"
@@ -423,10 +197,6 @@ if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
         RAM="${SNMP_RAM_MB:-2048}"
         MGMT_BR="${MGMT_BRIDGE:-ProxNET}"
         STORAGE=$(select_storage "rootdir" "Select Storage for Container Rootfs" "${DEFAULT_STORAGE:-}")
-        NET_MODE="DHCP"
-        STATIC_IP4=""
-        STATIC_GW4=""
-        STATIC_DNS="1.1.1.1 8.8.8.8"
     else
         # Advanced Settings
         echo -e "${YW}Using Advanced Settings${CL}"
@@ -446,25 +216,6 @@ if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
 
         MGMT_BR=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Network Bridge (ProxNET for Reverse Proxy):" 8 58 "${MGMT_BRIDGE:-ProxNET}" --title "BRIDGE" 3>&1 1>&2 2>&3 || echo "${MGMT_BRIDGE:-ProxNET}")
         MGMT_BR="${MGMT_BR:-ProxNET}"
-
-        NET_CHOICE=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
-            --title "IP CONFIGURATION" \
-            --radiolist "Select IP Assignment Method on bridge '${MGMT_BR}':" 10 65 2 \
-            "DHCP" "Auto-acquire IPv4/IPv6 from bridge, then freeze as static" ON \
-            "STATIC" "Manually specify Static IPv4 CIDR and Gateway" OFF 3>&1 1>&2 2>&3 || echo "DHCP")
-        NET_CHOICE="${NET_CHOICE:-DHCP}"
-
-        if [[ "$NET_CHOICE" == "STATIC" ]]; then
-            NET_MODE="STATIC"
-            STATIC_IP4=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Static IPv4 with CIDR (e.g. 192.168.1.50/24 or 10.0.0.50/24):" 8 65 "${STATIC_IP4:-}" --title "STATIC IPV4" 3>&1 1>&2 2>&3 || true)
-            STATIC_GW4=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Default Gateway IPv4 (e.g. 192.168.1.1 or 10.0.0.1):" 8 65 "${STATIC_GW4:-}" --title "GATEWAY IPV4" 3>&1 1>&2 2>&3 || true)
-            STATIC_DNS=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "DNS Nameservers:" 8 65 "${STATIC_DNS:-1.1.1.1 8.8.8.8}" --title "DNS SERVERS" 3>&1 1>&2 2>&3 || echo "1.1.1.1 8.8.8.8")
-        else
-            NET_MODE="DHCP"
-            STATIC_IP4=""
-            STATIC_GW4=""
-            STATIC_DNS="1.1.1.1 8.8.8.8"
-        fi
     fi
 else
     CTID="${SNMP_CTID:-$NEXT_ID}"
@@ -473,16 +224,6 @@ else
     RAM="${SNMP_RAM_MB:-2048}"
     MGMT_BR="${MGMT_BRIDGE:-ProxNET}"
     STORAGE=$(select_storage "rootdir" "Select Storage for Container Rootfs" "${DEFAULT_STORAGE:-}")
-    if [[ -n "${STATIC_IP4:-}" ]]; then
-        NET_MODE="STATIC"
-        STATIC_GW4="${STATIC_GW4:-}"
-        STATIC_DNS="${STATIC_DNS:-1.1.1.1 8.8.8.8}"
-    else
-        NET_MODE="DHCP"
-        STATIC_IP4=""
-        STATIC_GW4=""
-        STATIC_DNS="1.1.1.1 8.8.8.8"
-    fi
 fi
 
 # 2. Template Selection & Download
@@ -502,50 +243,25 @@ fi
 
 # 3. Create Unprivileged LXC Container on ProxNET
 echo -e "${BL}[*] Creating LXC Container [CTID: ${CTID}, Hostname: ${HOSTNAME}] on bridge '${MGMT_BR}'...${CL}"
-if [[ "$NET_MODE" == "STATIC" && -n "${STATIC_IP4:-}" ]]; then
-    create_net="name=eth0,bridge=${MGMT_BR},firewall=0,ip=${STATIC_IP4}"
-    [[ -n "${STATIC_GW4:-}" ]] && create_net+=",gw=${STATIC_GW4}"
-    pct create "$CTID" "${TMPL_STORAGE}:vztmpl/${CHOSEN_TMPL}" \
-        --hostname "$HOSTNAME" \
-        --ostype debian \
-        --cores "$CORES" \
-        --memory "$RAM" \
-        --swap 512 \
-        --storage "$STORAGE" \
-        --rootfs "${STORAGE}:8" \
-        --net0 "$create_net" \
-        --nameserver "${STATIC_DNS:-1.1.1.1 8.8.8.8}" \
-        --features nesting=1 \
-        --unprivileged 1 \
-        --onboot 1
-else
-    # DHCP Mode: DO NOT pass ip6=auto during creation to prevent ifupdown dual-stack boot crash in Debian 13
-    pct create "$CTID" "${TMPL_STORAGE}:vztmpl/${CHOSEN_TMPL}" \
-        --hostname "$HOSTNAME" \
-        --ostype debian \
-        --cores "$CORES" \
-        --memory "$RAM" \
-        --swap 512 \
-        --storage "$STORAGE" \
-        --rootfs "${STORAGE}:8" \
-        --net0 "name=eth0,bridge=${MGMT_BR},firewall=0,ip=dhcp" \
-        --features nesting=1 \
-        --unprivileged 1 \
-        --onboot 1
-fi
+pct create "$CTID" "${TMPL_STORAGE}:vztmpl/${CHOSEN_TMPL}" \
+    --hostname "$HOSTNAME" \
+    --ostype debian \
+    --cores "$CORES" \
+    --memory "$RAM" \
+    --swap 512 \
+    --storage "$STORAGE" \
+    --rootfs "${STORAGE}:8" \
+    --net0 "name=eth0,bridge=${MGMT_BR},firewall=0,ip=dhcp" \
+    --features nesting=1 \
+    --unprivileged 1 \
+    --onboot 1
 
 # 4. Start Container
 echo -e "${YW}[*] Starting container ${CTID}...${CL}"
 pct start "$CTID"
+sleep 5
 
-if [[ "$NET_MODE" == "DHCP" ]]; then
-    setup_container_dhcp "$CTID"
-fi
-
-# 5. Lock DHCP/SLAAC lease into STATIC IP configuration
-freeze_container_network "$CTID" "$MGMT_BR" "$NET_MODE"
-
-# 6. Execute Telemetry Installation Inside Container
+# 5. Execute Telemetry Installation Inside Container
 echo -e "${BL}[*] Installing SNMP, snmptrapd, rsyslog, and poller daemon inside container...${CL}"
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/install/install_snmp_collector.sh"
@@ -558,12 +274,22 @@ else
     pct exec "$CTID" -- bash -c "apt-get update -y && apt-get install -y snmp snmpd snmptrapd rsyslog curl jq python3"
 fi
 
+echo -e "${YW}[*] Retrieving container network IP...${CL}"
+CT_IP=""
+for i in {1..10}; do
+    CT_IP=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || true)
+    [[ -n "$CT_IP" ]] && break
+    sleep 1
+done
+CT_IP="${CT_IP:-DHCP}"
+CT_IP_V6=$(pct exec "$CTID" -- ip -6 addr show eth0 scope global 2>/dev/null | awk '/inet6 / {print $2}' | cut -d/ -f1 | head -n1 || true)
+
 echo -e "\n${GN}========================================================================${CL}"
 echo -e "${GN}  SNMP Telemetry Collector Container Deployed! [CTID: ${CTID}]           ${CL}"
 echo -e "${GN}========================================================================${CL}"
 echo -e "Network Bridge:       ${BL}${MGMT_BR}${CL} (Reverse Proxy Backend Network)"
-echo -e "Static IPv4 Address:  ${BL}${CT_IP}${CL}"
-[[ -n "${CT_IP_V6:-}" ]] && echo -e "Static IPv6 Address:  ${BL}${CT_IP_V6}${CL}"
+echo -e "Container IP:         ${BL}${CT_IP}${CL}"
+[[ -n "${CT_IP_V6:-}" ]] && echo -e "Container IPv6:       ${BL}${CT_IP_V6}${CL}"
 echo -e "SNMP Trap Receiver:   ${BL}${CT_IP}:162 (UDP)${CL}"
 echo -e "Syslog Server:        ${BL}${CT_IP}:514 (UDP/TCP)${CL}"
 echo -e "Access Console:       ${BL}pct enter ${CTID}${CL}\n"

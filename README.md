@@ -182,9 +182,8 @@ nano .env
 ### 4. Dedicated LXC Containers (`ct/`) & Network Architecture
 
 > [!NOTE]
-> **ProxNET & Automatic Static IP Freezing**:
-> All container creation helper scripts default to network bridge **`ProxNET`** (designed for backend application containers sitting behind an Nginx Reverse Proxy).
-> Containers initially acquire dynamic IPv4 (DHCP) and IPv6 (SLAAC/DHCPv6) addresses on boot, and then the helper scripts automatically freeze those exact addresses and default gateways into permanent **STATIC** configurations in Proxmox VE (`pct set <CTID> -net0 ...`).
+> **ProxNET Network Architecture**:
+> Container creation helper scripts default to network bridge **`ProxNET`** (designed for backend application containers sitting behind an Nginx Reverse Proxy) using standard DHCP.
 
 - **`ct/create_snmp_lxc.sh`**: Debian LXC collector for SNMP traps (port 162) and Syslog (port 514).
 - **`ct/create_nuclei_lxc.sh`**: ProjectDiscovery Nuclei vulnerability scanner LXC with official templates.
@@ -207,7 +206,7 @@ nano .env
 - **`distributed/wazuh5-distributed.sh`**:
   - Deploys a production-grade 3-node **Wazuh 5.0 Beta 5** cluster across dedicated LXC containers (Indexer, Manager, Dashboard).
   - **Dual-Homed Network Architecture**:
-    - **`net0` (Frontend / Reverse Proxy)**: Connected to bridge `ProxNET`, acquires dynamic IPv4/IPv6 leases and automatically freezes them to static IPs.
+    - **`net0` (Frontend / Reverse Proxy)**: Connected to bridge `ProxNET`, acquires dynamic IPv4/IPv6 address via DHCP.
     - **`net1` (Cluster SDN Fabric)**: Connected to SDN VNet `wazuhcl` (or tagged VLAN 1669 fallback) with dedicated static IPs:
       - **Wazuh Indexer**: `10.69.101.10/24`
       - **Wazuh Manager**: `10.69.101.11/24`
