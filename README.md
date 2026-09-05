@@ -54,9 +54,11 @@ proxmox-scripts/
 ├── provisioning/
 │   ├── autoinstall.sh            # Batch LXC provisioner & hardening engine
 │   ├── nowykontener.sh           # Single LXC provisioner & hardening script
-│   └── setup_lxc.sh -> nowykontener.sh # Convenience symlink
+│   ├── setup_lxc.sh -> nowykontener.sh # Convenience symlink
+│   └── update_wazuh_agent_v5.sh  # Automated Wazuh Agent v5 upgrade suite (Host, LXC, VM)
 ├── scripts/
-│   └── autoinstall.sh            # Host wrapper forwarding to /etc/pve/scripts/autoinstall.sh
+│   ├── autoinstall.sh            # Host wrapper forwarding to /etc/pve/scripts/autoinstall.sh
+│   └── update_wazuh_agent_v5.sh  # Host wrapper forwarding to update_wazuh_agent_v5.sh
 ├── vms/
 │   ├── create_trex_vm.sh         # Deploy Cisco TRex generator VM with Cloud-Init & DPDK tuning
 │   └── create_dut_vm.sh          # Deploy Router DUT VM (VyOS, OpenWrt, MikroTik, Debian)
@@ -122,7 +124,20 @@ nano .env
   - Executes during the `job-start` phase, backing up the hypervisor host right as the container/VM backup job begins.
   - Dynamically reads the node hostname (`$(hostname)`).
 
-### 2. LXC Provisioning & Security Hardening (`provisioning/`)
+### 2. LXC Provisioning & Wazuh Agent v5 Upgrade Suite (`provisioning/`)
+
+- **`provisioning/update_wazuh_agent_v5.sh`** (Host, LXC, KVM VMs):
+  - **Comprehensive Multi-Target Upgrade**: Upgrades the Proxmox host hypervisor, all running LXC containers, and all running QEMU KVM VMs (via QEMU Guest Agent) to the latest **Wazuh Agent v5** (`5.0.0-beta5` or version set in `.env`).
+  - **Local Host Caching**: Downloads official `.deb` and `.rpm` packages once to `/tmp/wazuh5_agent_cache/` on the host, pushing them into containers and VMs without wasting bandwidth.
+  - **Configuration Preservation**: Preserves existing `ossec.conf` while ensuring manager registration to `$WAZUH_MANAGER` and group `$WAZUH_AGENT_GROUP`.
+  - **Audit & Status Mode (`--status`)**: Produces a clean tabular report of current Wazuh Agent versions and active/inactive states across host, containers, and VMs.
+  - **Flexible CLI Targeting**:
+    - `--all`: Upgrade host, containers, and VMs in one command.
+    - `--host`: Upgrade host hypervisor node only.
+    - `--ct [CTID ...]`: Upgrade all running or specified LXC containers.
+    - `--vm [VMID ...]`: Upgrade all running or specified KVM virtual machines.
+    - `--force`: Reinstall or force upgrade even if already at v5.
+    - `--dry-run`: Simulate upgrades without modifying packages.
 
 - **`provisioning/nowykontener.sh`** (Single container) & **`provisioning/autoinstall.sh`** (Batch mode):
   - **OS Compatibility**: Ubuntu, Debian 12 (Bookworm), Debian 13 (Trixie), TurnKey Linux.
@@ -192,6 +207,21 @@ bash provisioning/autoinstall.sh
 ### Batch Provision Specific Containers:
 ```bash
 bash provisioning/autoinstall.sh 101 102 103
+```
+
+### Audit Wazuh Agent Versions Across Host, LXCs, and VMs:
+```bash
+bash provisioning/update_wazuh_agent_v5.sh --status
+```
+
+### Upgrade Wazuh Agent to v5 Across Everything (Host, All LXCs, All VMs):
+```bash
+bash provisioning/update_wazuh_agent_v5.sh --all
+```
+
+### Upgrade Wazuh Agent to v5 on Specific Containers and VMs:
+```bash
+bash provisioning/update_wazuh_agent_v5.sh --ct 100 101 --vm 200
 ```
 
 ---
