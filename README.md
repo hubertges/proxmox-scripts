@@ -69,16 +69,20 @@ proxmox-scripts/
 ├── ct/
 │   ├── create_snmp_lxc.sh        # Deploy SNMP & Syslog Telemetry Collector LXC
 │   ├── create_nuclei_lxc.sh      # Deploy ProjectDiscovery Nuclei Scanner LXC
+│   ├── create_zabbix_lxc.sh      # Deploy Zabbix 8.0 LTS + PostgreSQL 17 LXC (Debian 13)
+│   ├── zabbix.sh                 # Zabbix 8.0 LXC (Community-Scripts format)
 │   └── wazuh.sh                  # Deploy Wazuh 5 Beta All-in-One LXC
 ├── install/
 │   ├── install_trex.sh           # TRex DPDK installation & systemd daemon setup
 │   ├── install_snmp_collector.sh # SNMP daemon & syslog poller setup
 │   ├── install_nuclei.sh         # Nuclei scanner & templates setup
+│   ├── install_zabbix.sh         # Zabbix 8.0 + PostgreSQL 17 installer for Debian 13
 │   └── wazuh-install.sh          # Wazuh 5 container install assistant
 ├── distributed/
 │   └── wazuh5-distributed.sh     # Multi-node Wazuh 5 cluster installer
 ├── system-config/
 │   ├── lxc-auto-provision.service# Systemd service unit for automated LXC provisioning watcher
+│   ├── nginx-zabbix-reverse-proxy.conf # Production Nginx reverse proxy configuration for Zabbix
 │   ├── dpdk-bind.sh              # Automated DPDK driver binding utility (vfio-pci)
 │   ├── cpu-affinity.conf         # CPU pinning and core isolation settings
 │   ├── grub-tuning.conf          # Kernel boot parameters (isolcpus, default_hugepagesz)
@@ -178,7 +182,20 @@ nano .env
 
 - **`ct/create_snmp_lxc.sh`**: Debian LXC collector for SNMP traps (port 162) and Syslog (port 514).
 - **`ct/create_nuclei_lxc.sh`**: ProjectDiscovery Nuclei vulnerability scanner LXC with official templates.
+- **`ct/create_zabbix_lxc.sh`** & **`ct/zabbix.sh`**:
+  - Deploys a dedicated **Zabbix 8.0 LTS** monitoring container on **Debian 13 (Trixie)** with **PostgreSQL 17**.
+  - Includes Zabbix Server 8.0 daemon, PostgreSQL 17 database with automated schema initialization, Zabbix Agent 2, and pre-configured PHP 8.4 frontend.
+  - Exposes the internal web interface on port `8080` (ready for reverse proxying) and server trapper on port `10051`.
 - **`ct/wazuh.sh`**: Wazuh 5 Beta All-in-One LXC in Proxmox Community Helper Scripts format.
+
+### 5. Guest Appliance Installers (`install/`)
+
+- **`install/install_zabbix.sh`**: Idempotent installer for Zabbix 8.0 LTS, PostgreSQL 17, locales, DB schema import, automated `/etc/zabbix/web/zabbix.conf.php` generation, and external Nginx reverse proxy template generation.
+- **`install/install_trex.sh`**: TRex DPDK installation & systemd daemon setup.
+- **`install/install_snmp_collector.sh`**: SNMP daemon & syslog poller setup.
+- **`install/install_nuclei.sh`**: Nuclei scanner & templates setup.
+- **`install/wazuh-install.sh`**: Wazuh 5 container install assistant.
+
 
 ---
 
@@ -264,9 +281,21 @@ bash provisioning/update_wazuh_agent_v5.sh --status
 bash provisioning/update_wazuh_agent_v5.sh --all
 ```
 
-### Upgrade Wazuh Agent to v5 on Specific Containers and VMs:
+### Deploy Zabbix 8.0 LTS LXC Container (Debian 13 Trixie + PostgreSQL 17):
 ```bash
-bash provisioning/update_wazuh_agent_v5.sh --ct 100 101 --vm 200
+bash ct/create_zabbix_lxc.sh
+```
+
+### Configure External Nginx Reverse Proxy (on your other Nginx container):
+```bash
+# 1. Copy the reverse proxy template to your existing Nginx container:
+pct push <NGINX_CTID> system-config/nginx-zabbix-reverse-proxy.conf /etc/nginx/conf.d/zabbix.conf
+
+# 2. Update the upstream IP to match your newly deployed Zabbix LXC IP:
+pct exec <NGINX_CTID> -- sed -i 's/<ZABBIX_CONTAINER_IP>/<YOUR_ZABBIX_IP>/g' /etc/nginx/conf.d/zabbix.conf
+
+# 3. Test and reload Nginx:
+pct exec <NGINX_CTID> -- nginx -t && pct exec <NGINX_CTID> -- systemctl reload nginx
 ```
 
 ---
