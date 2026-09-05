@@ -111,6 +111,26 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Ensure jq is installed if possible, but do not fail if apt cannot run
+if ! command -v jq >/dev/null 2>&1; then
+    log_info "Installing 'jq' package on Proxmox host..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || true
+fi
+
+# Helper: Parse QEMU guest exec JSON output safely without requiring jq
+parse_guest_out() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '."out-data" // empty' 2>/dev/null || true
+    elif command -v perl >/dev/null 2>&1; then
+        perl -MJSON::PP -e 'local $/; my $d = eval { decode_json(<STDIN>) }; print $d->{"out-data"} // ""' 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys, json; print(json.load(sys.stdin).get("out-data", ""))' 2>/dev/null || true
+    else
+        sed -n 's/.*"out-data"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' 2>/dev/null || true
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 2. Package Downloader & Cache Manager
 # ------------------------------------------------------------------------------
@@ -477,7 +497,7 @@ update_vm() {
     local os_check_cmd="if command -v dpkg >/dev/null; then echo deb; elif command -v rpm >/dev/null; then echo rpm; else echo unknown; fi"
     
     local os_pkg_family
-    os_pkg_family=$(qm guest exec "$vmid" -- bash -c "$os_check_cmd" 2>/dev/null | jq -r '."out-data" // empty' | tr -d '\r\n' || echo "deb")
+    os_pkg_family=$(qm guest exec "$vmid" -- bash -c "$os_check_cmd" 2>/dev/null | parse_guest_out | tr -d '\r\n' || echo "deb")
     [[ -z "$os_pkg_family" ]] && os_pkg_family="deb"
 
     local cur_ver_cmd=""
@@ -488,7 +508,7 @@ update_vm() {
     fi
 
     local current_ver
-    current_ver=$(qm guest exec "$vmid" -- bash -c "$cur_ver_cmd" 2>/dev/null | jq -r '."out-data" // empty' | tr -d '\r\n' || echo "none")
+    current_ver=$(qm guest exec "$vmid" -- bash -c "$cur_ver_cmd" 2>/dev/null | parse_guest_out | tr -d '\r\n' || echo "none")
     [[ -z "$current_ver" ]] && current_ver="none"
 
     log_info "VM ${vmid} current Wazuh Agent version: ${BOLD}${current_ver}${NC}"
@@ -515,7 +535,7 @@ update_vm() {
     fi
 
     local exec_result
-    exec_result=$(qm guest exec "$vmid" -- bash -c "$update_script" 2>/dev/null | jq -r '."out-data" // empty' || echo "FAILED")
+    exec_result=$(qm guest exec "$vmid" -- bash -c "$update_script" 2>/dev/null | parse_guest_out || echo "FAILED")
 
     if [[ "$exec_result" == *"SUCCESS"* ]]; then
         log_ok "VM ${vmid} successfully upgraded to Wazuh Agent v5 (Active)."
@@ -566,10 +586,10 @@ show_status() {
             local vm_act="$vm_status"
             if [[ "$vm_status" == "running" ]]; then
                 if qm agent "$vmid" ping >/dev/null 2>&1; then
-                    vm_ver=$(qm guest exec "$vmid" -- bash -c "dpkg-query -W -f='\${Version}' wazuh-agent 2>/dev/null || rpm -q --queryformat '%{VERSION}' wazuh-agent 2>/dev/null || echo none" 2>/dev/null | jq -r '."out-data" // empty' | tr -d '\r\n' || echo "none")
+                    vm_ver=$(qm guest exec "$vmid" -- bash -c "dpkg-query -W -f='\${Version}' wazuh-agent 2>/dev/null || rpm -q --queryformat '%{VERSION}' wazuh-agent 2>/dev/null || echo none" 2>/dev/null | parse_guest_out | tr -d '\r\n' || echo "none")
                     [[ -z "$vm_ver" ]] && vm_ver="none"
                     local act_check
-                    act_check=$(qm guest exec "$vmid" -- systemctl is-active wazuh-agent 2>/dev/null | jq -r '."out-data" // empty' | tr -d '\r\n' || echo "inactive")
+                    act_check=$(qm guest exec "$vmid" -- systemctl is-active wazuh-agent 2>/dev/null | parse_guest_out | tr -d '\r\n' || echo "inactive")
                     [[ "$act_check" == "active" ]] && vm_act="active" || vm_act="inactive"
                 else
                     vm_act="no-agent"

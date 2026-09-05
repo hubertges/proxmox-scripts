@@ -28,6 +28,50 @@ if ! command -v pveversion >/dev/null 2>&1; then
     exit 1
 fi
 
+# Ensure jq is installed if possible, but do not fail if apt cannot run
+if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${YW}[*] 'jq' package not found. Installing jq on Proxmox host...${CL}"
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || true
+fi
+
+# Helper: Query PVE storage pools safely without requiring jq
+get_pve_storage() {
+    local content="$1"
+    local storages=()
+
+    if command -v jq >/dev/null 2>&1; then
+        mapfile -t storages < <(pvesh get /storage --output-format json 2>/dev/null | jq -r ".[] | select(.content | contains(\"${content}\")) | .storage" 2>/dev/null || true)
+    fi
+
+    if [[ ${#storages[@]} -eq 0 ]] && command -v perl >/dev/null 2>&1; then
+        mapfile -t storages < <(pvesh get /storage --output-format json 2>/dev/null | perl -MJSON::PP -e '
+            my $target = shift;
+            local $/;
+            my $raw = <STDIN>;
+            eval {
+                my $data = decode_json($raw);
+                for my $s (@$data) {
+                    if (exists $s->{content} && index($s->{content}, $target) != -1) {
+                        print $s->{storage} . "\n";
+                    }
+                }
+            };
+        ' "$content" 2>/dev/null || true)
+    fi
+
+    if [[ ${#storages[@]} -eq 0 && -f /etc/pve/storage.cfg ]]; then
+        mapfile -t storages < <(awk -v c="$content" '
+            /^[a-z0-9_-]+: / { cur = $2 }
+            cur && $1 == "content" && $0 ~ c { print cur }
+        ' /etc/pve/storage.cfg 2>/dev/null || true)
+    fi
+
+    for s in "${storages[@]}"; do
+        [[ -n "$s" ]] && echo "$s"
+    done
+}
+
 clear
 cat << "BANNER"
   ____  _   _ __  __ ____    ____      _ _           _             
@@ -40,26 +84,34 @@ BANNER
 echo -e "${BL}Central Telemetry & Audit Node for Router Performance Evaluation${CL}\n"
 
 # 1. Interactive or Default Parameters
-NEXT_ID=$(pvesh get /cluster/nextid)
+NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
 DEFAULT_CTID="${SNMP_CTID:-$NEXT_ID}"
-CTID=$(whiptail --backtitle "Proxmox SNMP Collector" --inputbox "Set Container ID (CTID):" 8 58 "$DEFAULT_CTID" --title "CONTAINER ID" 3>&1 1>&2 2>&3)
-HOSTNAME=$(whiptail --backtitle "Proxmox SNMP Collector" --inputbox "Set Hostname:" 8 58 "${SNMP_HOSTNAME:-snmp-telemetry-collector}" --title "HOSTNAME" 3>&1 1>&2 2>&3)
 
-STORAGE_LIST=($(pvesh get /storage --output-format json | jq -r ".[] | select(.content | contains(\"rootdir\")) | .storage"))
+if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
+    CTID=$(whiptail --backtitle "Proxmox SNMP Collector" --inputbox "Set Container ID (CTID):" 8 58 "$DEFAULT_CTID" --title "CONTAINER ID" 3>&1 1>&2 2>&3 || echo "$DEFAULT_CTID")
+    HOSTNAME=$(whiptail --backtitle "Proxmox SNMP Collector" --inputbox "Set Hostname:" 8 58 "${SNMP_HOSTNAME:-snmp-telemetry-collector}" --title "HOSTNAME" 3>&1 1>&2 2>&3 || echo "${SNMP_HOSTNAME:-snmp-telemetry-collector}")
+else
+    CTID="$DEFAULT_CTID"
+    HOSTNAME="${SNMP_HOSTNAME:-snmp-telemetry-collector}"
+fi
+CTID="${CTID:-$DEFAULT_CTID}"
+HOSTNAME="${HOSTNAME:-${SNMP_HOSTNAME:-snmp-telemetry-collector}}"
+
+mapfile -t STORAGE_LIST < <(get_pve_storage "rootdir")
 STORAGE_DEF="${DEFAULT_STORAGE:-${STORAGE_LIST[0]:-local-lvm}}"
 STORAGE="${STORAGE_DEF}"
 
 # 2. Template Selection & Download
-TEMPLATE_STORAGE_LIST=($(pvesh get /storage --output-format json | jq -r ".[] | select(.content | contains(\"vztmpl\")) | .storage"))
+mapfile -t TEMPLATE_STORAGE_LIST < <(get_pve_storage "vztmpl")
 TMPL_STORAGE="${TEMPLATE_STORAGE:-${TEMPLATE_STORAGE_LIST[0]:-local}}"
 TEMPLATE_DIR="/var/lib/vz/template/cache"
 
 echo -e "${YW}[*] Checking Debian standard LXC template...${CL}"
 pveam update > /dev/null 2>&1 || true
-AVAILABLE_TEMPLATES=($(pveam available -section system | awk '/debian-[1-9][0-9]-standard/ {print $2}'))
+mapfile -t AVAILABLE_TEMPLATES < <(pveam available -section system 2>/dev/null | awk '/debian-[1-9][0-9]-standard/ {print $2}' || true)
 CHOSEN_TMPL="${AVAILABLE_TEMPLATES[0]:-debian-12-standard_12.7-1_amd64.tar.zst}"
 
-if [[ ! -f "${TEMPLATE_DIR}/${CHOSEN_TMPL}" ]]; then
+if ! pveam list "$TMPL_STORAGE" 2>/dev/null | grep -q "$CHOSEN_TMPL" && [[ ! -f "${TEMPLATE_DIR}/${CHOSEN_TMPL}" ]]; then
     echo -e "${YW}[*] Downloading container template ${CHOSEN_TMPL}...${CL}"
     pveam download "$TMPL_STORAGE" "$CHOSEN_TMPL"
 fi

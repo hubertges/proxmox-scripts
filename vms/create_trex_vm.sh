@@ -31,6 +31,50 @@ if ! command -v pveversion >/dev/null 2>&1; then
     exit 1
 fi
 
+# Ensure jq is installed if possible, but do not fail if apt cannot run
+if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${YW}[*] 'jq' package not found. Installing jq on Proxmox host...${CL}"
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || true
+fi
+
+# Helper: Query PVE storage pools safely without requiring jq
+get_pve_storage() {
+    local content="$1"
+    local storages=()
+
+    if command -v jq >/dev/null 2>&1; then
+        mapfile -t storages < <(pvesh get /storage --output-format json 2>/dev/null | jq -r ".[] | select(.content | contains(\"${content}\")) | .storage" 2>/dev/null || true)
+    fi
+
+    if [[ ${#storages[@]} -eq 0 ]] && command -v perl >/dev/null 2>&1; then
+        mapfile -t storages < <(pvesh get /storage --output-format json 2>/dev/null | perl -MJSON::PP -e '
+            my $target = shift;
+            local $/;
+            my $raw = <STDIN>;
+            eval {
+                my $data = decode_json($raw);
+                for my $s (@$data) {
+                    if (exists $s->{content} && index($s->{content}, $target) != -1) {
+                        print $s->{storage} . "\n";
+                    }
+                }
+            };
+        ' "$content" 2>/dev/null || true)
+    fi
+
+    if [[ ${#storages[@]} -eq 0 && -f /etc/pve/storage.cfg ]]; then
+        mapfile -t storages < <(awk -v c="$content" '
+            /^[a-z0-9_-]+: / { cur = $2 }
+            cur && $1 == "content" && $0 ~ c { print cur }
+        ' /etc/pve/storage.cfg 2>/dev/null || true)
+    fi
+
+    for s in "${storages[@]}"; do
+        [[ -n "$s" ]] && echo "$s"
+    done
+}
+
 header_info() {
     clear
     cat << "BANNER"
@@ -83,17 +127,22 @@ else
 fi
 
 # 2. Interactive / Default Parameter Selection
-NEXT_ID=$(pvesh get /cluster/nextid)
+NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
 DEFAULT_VMID="${TREX_VMID:-$NEXT_ID}"
-VMID=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Set Virtual Machine ID:" 8 58 "$DEFAULT_VMID" --title "VM ID" 3>&1 1>&2 2>&3)
-VM_NAME=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Set Virtual Machine Hostname:" 8 58 "${TREX_HOSTNAME:-trex-generator-node}" --title "VM NAME" 3>&1 1>&2 2>&3)
-VCPU_CORES=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Allocate vCPU Cores (Min 4, Rec 8):" 8 58 "${TREX_CORES:-8}" --title "CPU ALLOCATION" 3>&1 1>&2 2>&3)
-RAM_MB=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Allocate RAM in MB (Min 4096, Rec 8192):" 8 58 "${TREX_RAM_MB:-8192}" --title "RAM ALLOCATION" 3>&1 1>&2 2>&3)
+VMID=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Set Virtual Machine ID:" 8 58 "$DEFAULT_VMID" --title "VM ID" 3>&1 1>&2 2>&3 || echo "$DEFAULT_VMID")
+VMID="${VMID:-$DEFAULT_VMID}"
+VM_NAME=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Set Virtual Machine Hostname:" 8 58 "${TREX_HOSTNAME:-trex-generator-node}" --title "VM NAME" 3>&1 1>&2 2>&3 || echo "${TREX_HOSTNAME:-trex-generator-node}")
+VM_NAME="${VM_NAME:-trex-generator-node}"
+VCPU_CORES=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Allocate vCPU Cores (Min 4, Rec 8):" 8 58 "${TREX_CORES:-8}" --title "CPU ALLOCATION" 3>&1 1>&2 2>&3 || echo "${TREX_CORES:-8}")
+VCPU_CORES="${VCPU_CORES:-8}"
+RAM_MB=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Allocate RAM in MB (Min 4096, Rec 8192):" 8 58 "${TREX_RAM_MB:-8192}" --title "RAM ALLOCATION" 3>&1 1>&2 2>&3 || echo "${TREX_RAM_MB:-8192}")
+RAM_MB="${RAM_MB:-8192}"
 
 # Storage selection
-STORAGE_LIST=($(pvesh get /storage --output-format json | jq -r ".[] | select(.content | contains(\"images\")) | .storage"))
+mapfile -t STORAGE_LIST < <(get_pve_storage "images")
 STORAGE_DEF="${DEFAULT_STORAGE:-${STORAGE_LIST[0]:-local-lvm}}"
-STORAGE=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Target Storage Pool for Disk:" 8 58 "$STORAGE_DEF" --title "STORAGE POOL" 3>&1 1>&2 2>&3)
+STORAGE=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Target Storage Pool for Disk:" 8 58 "$STORAGE_DEF" --title "STORAGE POOL" 3>&1 1>&2 2>&3 || echo "$STORAGE_DEF")
+STORAGE="${STORAGE:-$STORAGE_DEF}"
 
 CI_USER="${TREX_CI_USER:-trex}"
 CI_PASS="${TREX_CI_PASSWORD:-cisco123}"
