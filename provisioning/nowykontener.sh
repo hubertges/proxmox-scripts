@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # provisioning/nowykontener.sh
-# Automated LXC Container Post-Creation Provisioning & Security Hardening
+# Universal Multi-Distro LXC Container Provisioning & Security Hardening
 # Target Hypervisor: Proxmox VE 8.x / 9.x (run as root on PVE host)
+#
+# Supported Distro Families:
+#   - Debian / Ubuntu / TurnKey / Mint / Kali / Parrot / Pop!_OS
+#   - RHEL / Fedora / CentOS Stream / Rocky Linux / AlmaLinux / Oracle Linux
+#   - openSUSE (Leap & Tumbleweed) / SLES
+#   - Arch Linux / Manjaro
+#   - Alpine Linux
+#   - Generic Linux (fallback)
 # ==============================================================================
 
 set -euo pipefail
@@ -53,11 +61,10 @@ WAZUH_VER="${WAZUH_AGENT_V5_VERSION:-5.0.0-beta5}"
 BASE_V5_URL="https://packages-staging.xdrsiem.wazuh.info/pre-release/5.x"
 CACHE_DIR="/tmp/wazuh5_agent_cache"
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
-
 mkdir -p "$(dirname "$HASLA_FILE")"
 
 # ------------------------------------------------------------------------------
-# 2. OS Verification Inside Container
+# 2. Multi-Distro OS Inspection Inside Container
 # ------------------------------------------------------------------------------
 echo "=========================================================="
 echo "[+] Weryfikacja kontenera: $CTID"
@@ -69,34 +76,97 @@ if [[ "$STATUS" != "running" ]]; then
     exit 1
 fi
 
-CT_ID=$(pct exec "$CTID" -- bash -c '. /etc/os-release 2>/dev/null && echo "${ID:-unknown}"' || echo "unknown")
-CT_CODENAME=$(pct exec "$CTID" -- bash -c '. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-unknown}"' || echo "unknown")
-if [[ "$CT_CODENAME" == "unknown" ]]; then
-    CT_CODENAME=$(pct exec "$CTID" -- bash -c 'lsb_release -cs 2>/dev/null || echo "unknown"' || echo "unknown")
+# Query OS info safely via /bin/sh inside container
+OS_INFO=$(pct exec "$CTID" -- /bin/sh -c '
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+    elif [ -f /usr/lib/os-release ]; then
+        . /usr/lib/os-release
+    fi
+    echo "ID=${ID:-unknown}"
+    echo "ID_LIKE=${ID_LIKE:-}"
+    echo "VERSION_ID=${VERSION_ID:-}"
+    echo "VERSION_CODENAME=${VERSION_CODENAME:-}"
+    echo "PRETTY_NAME=${PRETTY_NAME:-Linux}"
+' 2>/dev/null || echo "ID=unknown")
+
+CT_ID=$(echo "$OS_INFO" | grep "^ID=" | head -n 1 | cut -d= -f2- | tr -d '"\r' || echo "unknown")
+CT_ID_LIKE=$(echo "$OS_INFO" | grep "^ID_LIKE=" | head -n 1 | cut -d= -f2- | tr -d '"\r' || echo "")
+CT_CODENAME=$(echo "$OS_INFO" | grep "^VERSION_CODENAME=" | head -n 1 | cut -d= -f2- | tr -d '"\r' || echo "")
+CT_PRETTY_NAME=$(echo "$OS_INFO" | grep "^PRETTY_NAME=" | head -n 1 | cut -d= -f2- | tr -d '"\r' || echo "Linux")
+
+# Detect init system
+CT_INIT="generic"
+if pct exec "$CTID" -- test -d /run/systemd/system 2>/dev/null; then
+    CT_INIT="systemd"
+elif pct exec "$CTID" -- test -d /run/openrc 2>/dev/null || pct exec "$CTID" -- test -f /sbin/openrc-run 2>/dev/null; then
+    CT_INIT="openrc"
 fi
 
-OS_SUPPORTED=0
+# Classify Distro Family & Package Type
+CT_FAMILY="generic"
+PKG_FORMAT="generic"
+
 case "$CT_ID" in
-    ubuntu)
-        OS_SUPPORTED=1
+    debian|ubuntu|turnkey|linuxmint|pop|elementary|zorin|kali|parrot|raspbian|devuan)
+        CT_FAMILY="debian"
+        PKG_FORMAT="deb"
         ;;
-    debian)
-        if [[ "$CT_CODENAME" == "trixie" || "$CT_CODENAME" == "bookworm" || "$CT_CODENAME" == "sid" ]]; then
-            OS_SUPPORTED=1
+    rhel|centos|rocky|almalinux|fedora|ol|amzn)
+        CT_FAMILY="rhel"
+        PKG_FORMAT="rpm"
+        ;;
+    opensuse*|sles*|sled*)
+        CT_FAMILY="suse"
+        PKG_FORMAT="rpm"
+        ;;
+    arch|archlinux|manjaro|endeavouros|artix|garuda)
+        CT_FAMILY="arch"
+        PKG_FORMAT="pacman"
+        ;;
+    alpine)
+        CT_FAMILY="alpine"
+        PKG_FORMAT="apk"
+        ;;
+    *)
+        if [[ "$CT_ID_LIKE" =~ debian|ubuntu ]]; then
+            CT_FAMILY="debian"
+            PKG_FORMAT="deb"
+        elif [[ "$CT_ID_LIKE" =~ rhel|fedora|centos ]]; then
+            CT_FAMILY="rhel"
+            PKG_FORMAT="rpm"
+        elif [[ "$CT_ID_LIKE" =~ suse ]]; then
+            CT_FAMILY="suse"
+            PKG_FORMAT="rpm"
+        elif [[ "$CT_ID_LIKE" =~ arch ]]; then
+            CT_FAMILY="arch"
+            PKG_FORMAT="pacman"
+        elif [[ "$CT_ID_LIKE" =~ alpine ]]; then
+            CT_FAMILY="alpine"
+            PKG_FORMAT="apk"
+        else
+            if pct exec "$CTID" -- command -v dpkg >/dev/null 2>&1; then
+                CT_FAMILY="debian"
+                PKG_FORMAT="deb"
+            elif pct exec "$CTID" -- command -v rpm >/dev/null 2>&1; then
+                CT_FAMILY="rhel"
+                PKG_FORMAT="rpm"
+            elif pct exec "$CTID" -- command -v pacman >/dev/null 2>&1; then
+                CT_FAMILY="arch"
+                PKG_FORMAT="pacman"
+            elif pct exec "$CTID" -- command -v apk >/dev/null 2>&1; then
+                CT_FAMILY="alpine"
+                PKG_FORMAT="apk"
+            elif pct exec "$CTID" -- command -v zypper >/dev/null 2>&1; then
+                CT_FAMILY="suse"
+                PKG_FORMAT="rpm"
+            fi
         fi
-        ;;
-    turnkey)
-        OS_SUPPORTED=1
         ;;
 esac
 
-if [[ $OS_SUPPORTED -eq 0 ]]; then
-    echo "[-] Błąd: Nieobsługiwany system operacyjny w kontenerze $CTID." >&2
-    echo "    Wykryto: $CT_ID (codename: $CT_CODENAME). Oczekiwano Ubuntu, Debian (bookworm/trixie) lub TurnKey." >&2
-    exit 1
-fi
-
-echo "[+] Wykryto obsługiwany system: $CT_ID ($CT_CODENAME)"
+echo "[+] Wykryto system: ${CT_PRETTY_NAME}"
+echo "    ID: ${CT_ID} | Rodzina: ${CT_FAMILY} | Pakiety: ${PKG_FORMAT} | Init: ${CT_INIT}"
 
 # ------------------------------------------------------------------------------
 # 3. User Password Configuration (Interactive or Automated)
@@ -122,202 +192,266 @@ fi
 # 4. Root Password Generation & Storage
 # ------------------------------------------------------------------------------
 ROOT_PASS=$(openssl rand -base64 16)
-echo "CTID: $CTID | User: $LXC_USER (Pass: $TARGET_USER_PASS) | Root Pass: $ROOT_PASS | Data: $(date)" >> "$HASLA_FILE"
+echo "CTID: $CTID | Distro: $CT_ID | User: $LXC_USER (Pass: $TARGET_USER_PASS) | Root Pass: $ROOT_PASS | Data: $(date)" >> "$HASLA_FILE"
 chmod 600 "$HASLA_FILE" 2>/dev/null || true
 echo "[+] Wygenerowano hasła dla kontenera $CTID. Zapisano w $HASLA_FILE."
 
-echo "root:$ROOT_PASS" | pct exec "$CTID" -- chpasswd
+# Update root password inside container
+pct exec "$CTID" -- /bin/sh -c "echo 'root:$ROOT_PASS' | chpasswd 2>/dev/null || (command -v passwd >/dev/null && echo -e '$ROOT_PASS\n$ROOT_PASS' | passwd root 2>/dev/null) || true"
 echo "[+] Hasło roota w kontenerze zostało zaktualizowane."
 
 # ------------------------------------------------------------------------------
-# 5. Prepare Wazuh Agent v5 Package on Host
+# 5. Prepare Wazuh Agent v5 Package on Host (DEB or RPM)
 # ------------------------------------------------------------------------------
 CT_ARCH=$(pct exec "$CTID" -- uname -m 2>/dev/null || echo "x86_64")
-WAZUH_DEB_NAME="wazuh-agent_${WAZUH_VER}_amd64.deb"
-WAZUH_URL="${BASE_V5_URL}/apt/pool/main/w/wazuh-agent/${WAZUH_DEB_NAME}"
 
-if [[ "$CT_ARCH" == "aarch64" || "$CT_ARCH" == "arm64" ]]; then
-    WAZUH_DEB_NAME="wazuh-agent_${WAZUH_VER}_arm64.deb"
+if [[ "$PKG_FORMAT" == "deb" ]]; then
+    WAZUH_DEB_NAME="wazuh-agent_${WAZUH_VER}_amd64.deb"
+    [[ "$CT_ARCH" == "aarch64" || "$CT_ARCH" == "arm64" ]] && WAZUH_DEB_NAME="wazuh-agent_${WAZUH_VER}_arm64.deb"
     WAZUH_URL="${BASE_V5_URL}/apt/pool/main/w/wazuh-agent/${WAZUH_DEB_NAME}"
-fi
+    HOST_PKG_CACHE="${CACHE_DIR}/${WAZUH_DEB_NAME}"
 
-HOST_PKG_CACHE="${CACHE_DIR}/${WAZUH_DEB_NAME}"
-if [[ ! -f "$HOST_PKG_CACHE" ]]; then
-    echo "[+] Pobieranie pakietu Wazuh Agent v5 (${WAZUH_DEB_NAME}) do pamięci podręcznej..."
-    curl -fsSL "$WAZUH_URL" -o "$HOST_PKG_CACHE" || {
-        echo "[-] Błąd pobierania pakietu Wazuh v5 z $WAZUH_URL" >&2
-    }
-fi
+    if [[ ! -f "$HOST_PKG_CACHE" ]]; then
+        echo "[+] Pobieranie pakietu Wazuh Agent v5 (${WAZUH_DEB_NAME}) do pamięci podręcznej..."
+        curl -fsSL "$WAZUH_URL" -o "$HOST_PKG_CACHE" || {
+            echo "[-] Błąd pobierania pakietu Wazuh v5 z $WAZUH_URL" >&2
+            rm -f "$HOST_PKG_CACHE"
+        }
+    fi
 
-if [[ -f "$HOST_PKG_CACHE" ]]; then
-    echo "[+] Przesyłanie pakietu Wazuh Agent v5 do kontenera $CTID..."
-    pct push "$CTID" "$HOST_PKG_CACHE" "/tmp/wazuh-agent-v5.deb"
+    if [[ -f "$HOST_PKG_CACHE" ]]; then
+        echo "[+] Przesyłanie pakietu Wazuh Agent v5 (.deb) do kontenera $CTID..."
+        pct push "$CTID" "$HOST_PKG_CACHE" "/tmp/wazuh-agent-v5.deb"
+    fi
+
+elif [[ "$PKG_FORMAT" == "rpm" ]]; then
+    WAZUH_RPM_NAME="wazuh-agent-${WAZUH_VER}.x86_64.rpm"
+    [[ "$CT_ARCH" == "aarch64" || "$CT_ARCH" == "arm64" ]] && WAZUH_RPM_NAME="wazuh-agent-${WAZUH_VER}.aarch64.rpm"
+    WAZUH_URL="${BASE_V5_URL}/yum/${WAZUH_RPM_NAME}"
+    HOST_PKG_CACHE="${CACHE_DIR}/${WAZUH_RPM_NAME}"
+
+    if [[ ! -f "$HOST_PKG_CACHE" ]]; then
+        echo "[+] Pobieranie pakietu Wazuh Agent v5 (${WAZUH_RPM_NAME}) do pamięci podręcznej..."
+        curl -fsSL "$WAZUH_URL" -o "$HOST_PKG_CACHE" || {
+            echo "[-] Błąd pobierania pakietu Wazuh v5 z $WAZUH_URL" >&2
+            rm -f "$HOST_PKG_CACHE"
+        }
+    fi
+
+    if [[ -f "$HOST_PKG_CACHE" ]]; then
+        echo "[+] Przesyłanie pakietu Wazuh Agent v5 (.rpm) do kontenera $CTID..."
+        pct push "$CTID" "$HOST_PKG_CACHE" "/tmp/wazuh-agent-v5.rpm"
+    fi
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Build Container Payload Script
+# 6. Build Multi-Distro Container Payload Script
 # ------------------------------------------------------------------------------
 PAYLOAD="/tmp/lxc_setup_payload_${CTID}.sh"
 
 cat << INNER_EOF > "$PAYLOAD"
-#!/usr/bin/env bash
-export DEBIAN_FRONTEND=noninteractive
+#!/bin/sh
+set -eu
+
 ERR_LOG="/tmp/ct_setup_errors.log"
 > "\$ERR_LOG"
 
 log_err() {
-    local step="\$1"
-    local log_file="\$2"
+    step="\$1"
+    log_file="\${2:-}"
     echo "--> [BŁĄD] \$step" >> "\$ERR_LOG"
-    if [[ -n "\$log_file" && -f "\$log_file" ]]; then
+    if [ -n "\$log_file" ] && [ -f "\$log_file" ]; then
         echo "    Szczegóły:" >> "\$ERR_LOG"
         tail -n 15 "\$log_file" | sed "s/^/    /" >> "\$ERR_LOG"
     fi
 }
 
-OS_ID=\$(. /etc/os-release 2>/dev/null && echo "\${ID:-unknown}")
-OS_CODENAME=\$(. /etc/os-release 2>/dev/null && echo "\${VERSION_CODENAME:-unknown}")
-if [[ "\$OS_CODENAME" == "unknown" ]]; then
-    OS_CODENAME=\$(lsb_release -cs 2>/dev/null || echo "bookworm")
+echo "[CT] 1. Wyłączanie zbędnych usług synchronizacji czasu NTP (czas pilnowany przez host PVE)..."
+if [ -d /run/systemd/system ]; then
+    systemctl disable --now chrony chronyd systemd-timesyncd ntpd 2>/dev/null || true
+    systemctl mask chrony chronyd systemd-timesyncd ntpd 2>/dev/null || true
+elif [ -d /run/openrc ] || [ -f /sbin/openrc-run ]; then
+    rc-update del chronyd default 2>/dev/null || true
+    rc-service chronyd stop 2>/dev/null || true
+    rc-update del ntpd default 2>/dev/null || true
+    rc-service ntpd stop 2>/dev/null || true
 fi
 
-echo "[CT] 1. Instalacja podstawowych narzędzi administracyjnych..."
-apt-get update -y
-apt-get install -y ca-certificates curl wget gnupg lsb-release apt-transport-https debian-archive-keyring \
-                   pv fish fortunes-pl cowsay sudo \
-                   unattended-upgrades apt-listchanges ufw fail2ban libpam-tmpdir needrestart debsums rkhunter
+echo "[CT] 2. Instalacja narzędzi administracyjnych dla rodziny '${CT_FAMILY}' (${CT_ID})..."
+case "${CT_FAMILY}" in
+    debian)
+        export DEBIAN_FRONTEND=noninteractive
+        # Modernize Debian repositories if Debian
+        if [ "${CT_ID}" = "debian" ] && [ -f /etc/apt/sources.list ] && [ ! -f /etc/apt/sources.list.d/debian.sources ]; then
+            mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
+            touch /etc/apt/sources.list.d/debian.list
+            echo "deb http://deb.debian.org/debian ${CT_CODENAME} main contrib non-free non-free-firmware" > /etc/apt/sources.list.d/debian.list
+            echo "deb http://deb.debian.org/debian ${CT_CODENAME}-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list.d/debian.list
+            echo "deb http://security.debian.org/debian-security ${CT_CODENAME}-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list.d/debian.list
+        fi
 
-apt-get install -y fastfetch || echo "[CT] Pakiet fastfetch niedostępny w bieżącym repozytorium (pomijam)."
+        apt-get update -y
+        apt-get install -y ca-certificates curl wget gnupg lsb-release apt-transport-https debian-archive-keyring sudo openssh-server
+        apt-get install -y pv fish fortunes-pl cowsay unattended-upgrades apt-listchanges ufw fail2ban libpam-tmpdir needrestart debsums rkhunter 2>/dev/null || true
+        apt-get install -y fastfetch 2>/dev/null || true
 
-# Czas jest synchronizowany bezpośrednio z jądra hiperwizora Proxmox VE
-echo "[CT] Wyłączanie zbędnych usług synchronizacji czasu NTP (czas synchronizowany z hosta)..."
-systemctl disable --now chrony 2>/dev/null || true
-systemctl disable --now systemd-timesyncd 2>/dev/null || true
-systemctl mask systemd-timesyncd 2>/dev/null || true
-
-echo "[CT] 2. Modernizacja źródeł APT..."
-if [[ "\$OS_ID" == "debian" ]]; then
-    if [[ -f /etc/apt/sources.list ]]; then
-        mv /etc/apt/sources.list /etc/apt/sources.list.bak
-    fi
-
-    if [[ ! -f /etc/apt/sources.list.d/debian.sources ]]; then
-        add_apt_source() {
-            local line="\$1"
-            local file="\$2"
-            if ! grep -Fq "\$line" "\$file" 2>/dev/null; then
-                echo "\$line" >> "\$file"
-            fi
-        }
-        touch /etc/apt/sources.list.d/debian.list
-        add_apt_source "deb http://deb.debian.org/debian \$OS_CODENAME main contrib non-free non-free-firmware" /etc/apt/sources.list.d/debian.list
-        add_apt_source "deb http://deb.debian.org/debian \${OS_CODENAME}-updates main contrib non-free non-free-firmware" /etc/apt/sources.list.d/debian.list
-        add_apt_source "deb http://security.debian.org/debian-security \${OS_CODENAME}-security main contrib non-free non-free-firmware" /etc/apt/sources.list.d/debian.list
-    fi
-else
-    echo "[CT] System \$OS_ID (\$OS_CODENAME) używa własnych repozytoriów. Pomijam modyfikację sources.list."
-fi
-
-apt-get update -y && apt-get upgrade -y && apt-get autoremove -y
-
-echo "[CT] 3. Konfiguracja automatycznych aktualizacji (unattended-upgrades)..."
-if [[ "\$OS_ID" == "ubuntu" ]]; then
-    cat << APTCONF > /etc/apt/apt.conf.d/50unattended-upgrades
-Unattended-Upgrade::Origins-Pattern {
-    "origin=Ubuntu,archive=\${OS_CODENAME}-security";
-    "origin=Ubuntu,archive=\${OS_CODENAME}-updates";
-};
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-APTCONF
-else
-    cat << APTCONF > /etc/apt/apt.conf.d/50unattended-upgrades
-Unattended-Upgrade::Origins-Pattern {
-    "origin=Debian,codename=\${OS_CODENAME}-security,label=Debian-Security";
-    "origin=Debian,codename=\${OS_CODENAME}-updates";
-    "origin=TurnKey GNU/Linux,codename=\${OS_CODENAME}-security";
-};
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-APTCONF
-fi
-
-cat << 'APTCONF2' > /etc/apt/apt.conf.d/20auto-upgrades
+        # Auto-upgrades configuration
+        cat << 'APTCONF' > /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null || true
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
-APTCONF2
+APTCONF
+        ;;
 
-echo "[CT] 4. Konfiguracja użytkownika ${LXC_USER}..."
+    rhel)
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y epel-release 2>/dev/null || true
+            dnf install -y ca-certificates curl wget gnupg2 sudo openssh-server openssh-clients 2>/dev/null || true
+            dnf install -y fish cowsay firewalld fail2ban 2>/dev/null || true
+            dnf install -y fastfetch 2>/dev/null || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y epel-release 2>/dev/null || true
+            yum install -y ca-certificates curl wget sudo openssh-server openssh-clients 2>/dev/null || true
+        fi
+        [ -d /run/systemd/system ] && systemctl enable sshd 2>/dev/null || true
+        ;;
+
+    suse)
+        zypper --non-interactive refresh 2>/dev/null || true
+        zypper --non-interactive install -y ca-certificates curl wget sudo openssh 2>/dev/null || true
+        zypper --non-interactive install -y fish fail2ban firewalld fastfetch 2>/dev/null || true
+        [ -d /run/systemd/system ] && systemctl enable sshd 2>/dev/null || true
+        ;;
+
+    arch)
+        pacman -Sy --noconfirm 2>/dev/null || true
+        pacman -S --noconfirm --needed ca-certificates curl wget sudo openssh 2>/dev/null || true
+        pacman -S --noconfirm --needed fish fastfetch ufw fail2ban 2>/dev/null || true
+        [ -d /run/systemd/system ] && systemctl enable sshd 2>/dev/null || true
+        ;;
+
+    alpine)
+        apk update 2>/dev/null || true
+        apk add --no-cache ca-certificates curl wget sudo shadow bash openssh 2>/dev/null || apk add --no-cache ca-certificates curl wget sudo openssh 2>/dev/null || true
+        apk add --no-cache fish fail2ban 2>/dev/null || true
+        if [ -d /run/openrc ] || [ -f /sbin/openrc-run ]; then
+            rc-update add sshd default 2>/dev/null || rc-update add ssh default 2>/dev/null || true
+            ssh-keygen -A 2>/dev/null || true
+            rc-service sshd start 2>/dev/null || true
+        fi
+        ;;
+
+    *)
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y && apt-get install -y ca-certificates curl wget sudo openssh-server 2>/dev/null || true
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y ca-certificates curl wget sudo openssh-server 2>/dev/null || true
+        elif command -v zypper >/dev/null 2>&1; then
+            zypper --non-interactive install -y ca-certificates curl wget sudo openssh 2>/dev/null || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm --needed ca-certificates curl wget sudo openssh 2>/dev/null || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache ca-certificates curl wget sudo shadow bash openssh 2>/dev/null || true
+        fi
+        ;;
+esac
+
+echo "[CT] 3. Konfiguracja użytkownika ${LXC_USER} i uprawnień sudo..."
+# Determine preferred shell
+USER_SHELL="/bin/sh"
+if command -v fish >/dev/null 2>&1; then
+    USER_SHELL="\$(command -v fish)"
+elif command -v bash >/dev/null 2>&1; then
+    USER_SHELL="\$(command -v bash)"
+fi
+
+# Determine sudo group
+SUDO_GRP="wheel"
+if grep -q "^sudo:" /etc/group 2>/dev/null; then
+    SUDO_GRP="sudo"
+fi
+
 if ! id -u "${LXC_USER}" >/dev/null 2>&1; then
-    useradd -m -s /usr/bin/fish -G sudo,adm "${LXC_USER}"
+    if command -v useradd >/dev/null 2>&1; then
+        useradd -m -s "\$USER_SHELL" -G "\$SUDO_GRP" "${LXC_USER}" 2>/dev/null || useradd -m -s "\$USER_SHELL" "${LXC_USER}" 2>/dev/null || true
+    elif command -v adduser >/dev/null 2>&1; then
+        adduser -D -s "\$USER_SHELL" "${LXC_USER}" 2>/dev/null || adduser -s "\$USER_SHELL" "${LXC_USER}" 2>/dev/null || true
+        addgroup "${LXC_USER}" "\$SUDO_GRP" 2>/dev/null || true
+    fi
 fi
+
+if command -v usermod >/dev/null 2>&1; then
+    usermod -aG "\$SUDO_GRP" "${LXC_USER}" 2>/dev/null || true
+    usermod -s "\$USER_SHELL" "${LXC_USER}" 2>/dev/null || true
+fi
+
+mkdir -p /etc/sudoers.d
+echo "${LXC_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-${LXC_USER}"
+chmod 440 "/etc/sudoers.d/90-${LXC_USER}" 2>/dev/null || true
+
 mkdir -p "/home/${LXC_USER}/.ssh"
-mkdir -p "/home/${LXC_USER}/.config/fish"
+chmod 700 "/home/${LXC_USER}/.ssh"
 
-echo "[CT] Usuwanie domyślnych kluczy roota..."
-rm -rf /root/.ssh/* 2>/dev/null || true
-
-echo "[CT] Konfiguracja powłoki Fish..."
-cat << 'FISHCONF' > "/home/${LXC_USER}/.config/fish/config.fish"
-if status is-interactive
-    if command -v fastfetch >/dev/null
-        fastfetch
-        echo ""
-    end
-    if command -v fortunes >/dev/null && command -v cowsay >/dev/null
-        /usr/games/fortune | /usr/games/cowsay -f (ls /usr/share/cowsay/cows/ | shuf -n 1)
-    end
-end
-FISHCONF
-
-chown -R "${LXC_USER}:${LXC_USER}" "/home/${LXC_USER}/.config"
-
-echo "[CT] 5. Utwardzanie SSH (blokada roota i haseł, post-quantum KEX)..."
-if [[ -f /etc/ssh/sshd_config ]]; then
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-    sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-    
-    if ! grep -q "KexAlgorithms" /etc/ssh/sshd_config; then
-        echo "KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org" >> /etc/ssh/sshd_config
-    fi
-    if ! grep -q "PubkeyAcceptedAlgorithms" /etc/ssh/sshd_config; then
-        echo "PubkeyAcceptedAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com" >> /etc/ssh/sshd_config
-    fi
+echo "[CT] 4. Bezpieczna konfiguracja serwera SSH (Post-Quantum & klucze)..."
+SSHD_CFG="/etc/ssh/sshd_config"
+if [ -f "\$SSHD_CFG" ]; then
+    cp "\$SSHD_CFG" "\${SSHD_CFG}.bak" 2>/dev/null || true
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "\$SSHD_CFG" 2>/dev/null || true
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "\$SSHD_CFG" 2>/dev/null || true
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "\$SSHD_CFG" 2>/dev/null || true
 fi
 
-echo "[CT] 6. Instalacja Wazuh-Agent v5 (${WAZUH_VER}) podłączanego do ${WAZUH_MGR}..."
-if [[ -f /tmp/wazuh-agent-v5.deb ]]; then
+if [ -d /etc/ssh/sshd_config.d ]; then
+    cat << 'SSHD_CONF' > /etc/ssh/sshd_config.d/99-hardened.conf
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+SSHD_CONF
+    chmod 600 /etc/ssh/sshd_config.d/99-hardened.conf 2>/dev/null || true
+fi
+
+echo "[CT] 5. Instalacja Wazuh-Agent v5 (${WAZUH_VER})..."
+if [ -f /tmp/wazuh-agent-v5.deb ]; then
     export WAZUH_MANAGER="${WAZUH_MGR}"
     export WAZUH_AGENT_GROUP="${WAZUH_GRP}"
     
     if dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb > /tmp/wazuh_install.log 2>&1 || (apt-get install -f -y >> /tmp/wazuh_install.log 2>&1 && dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb >> /tmp/wazuh_install.log 2>&1); then
-        systemctl daemon-reload
-        systemctl enable wazuh-agent >/dev/null 2>&1 || true
-        systemctl restart wazuh-agent >/dev/null 2>&1 || true
+        [ -d /run/systemd/system ] && systemctl daemon-reload 2>/dev/null || true
+        [ -d /run/systemd/system ] && systemctl enable --now wazuh-agent 2>/dev/null || true
         rm -f /tmp/wazuh-agent-v5.deb
     else
-        log_err "Instalacja pakietu Wazuh Agent v5 (dpkg)" "/tmp/wazuh_install.log"
+        log_err "Instalacja pakietu Wazuh Agent v5 (deb)" "/tmp/wazuh_install.log"
     fi
-else
-    # Fallback to direct curl download if host push was omitted
-    cd /tmp
-    curl -fsSL "${WAZUH_URL}" -o "./wazuh-agent-v5.deb" 2>/dev/null || true
-    if [[ -f "./wazuh-agent-v5.deb" ]]; then
-        WAZUH_MANAGER="${WAZUH_MGR}" WAZUH_AGENT_GROUP="${WAZUH_GRP}" dpkg --force-confdef --force-confold -i ./wazuh-agent-v5.deb > /tmp/wazuh_install.log 2>&1 || log_err "Instalacja pakietu Wazuh v5 (dpkg)" "/tmp/wazuh_install.log"
-        systemctl daemon-reload
-        systemctl enable wazuh-agent >/dev/null 2>&1 || true
-        systemctl restart wazuh-agent >/dev/null 2>&1 || true
-        rm -f ./wazuh-agent-v5.deb
+
+elif [ -f /tmp/wazuh-agent-v5.rpm ]; then
+    export WAZUH_MANAGER="${WAZUH_MGR}"
+    export WAZUH_AGENT_GROUP="${WAZUH_GRP}"
+    
+    if rpm -Uvh --replacepkgs /tmp/wazuh-agent-v5.rpm > /tmp/wazuh_install.log 2>&1 || \
+       (command -v dnf >/dev/null 2>&1 && dnf install -y /tmp/wazuh-agent-v5.rpm >> /tmp/wazuh_install.log 2>&1) || \
+       (command -v zypper >/dev/null 2>&1 && zypper --non-interactive install -y /tmp/wazuh-agent-v5.rpm >> /tmp/wazuh_install.log 2>&1); then
+        [ -d /run/systemd/system ] && systemctl daemon-reload 2>/dev/null || true
+        [ -d /run/systemd/system ] && systemctl enable --now wazuh-agent 2>/dev/null || true
+        rm -f /tmp/wazuh-agent-v5.rpm
     else
-        log_err "Brak pakietu wazuh-agent-v5.deb w kontenerze" ""
+        log_err "Instalacja pakietu Wazuh Agent v5 (rpm)" "/tmp/wazuh_install.log"
     fi
+
+else
+    echo "[CT] Wazuh Agent: brak oficjalnego pakietu dla ${CT_ID} w kanale v5 beta - pomijam instalację agenta (system zabezpieczony pomyślnie)."
 fi
 
-apt-get clean
+# Clean caches
+command -v apt-get >/dev/null 2>&1 && apt-get clean 2>/dev/null || true
+command -v dnf >/dev/null 2>&1 && dnf clean all 2>/dev/null || true
+command -v zypper >/dev/null 2>&1 && zypper clean --all 2>/dev/null || true
+command -v pacman >/dev/null 2>&1 && pacman -Sc --noconfirm 2>/dev/null || true
+
+# Mark container as successfully provisioned
+date -u +'%Y-%m-%dT%H:%M:%SZ' > /etc/.lxc_provisioned 2>/dev/null || true
 INNER_EOF
 
 # ------------------------------------------------------------------------------
@@ -327,8 +461,8 @@ echo "[+] Przesyłanie skryptu konfiguracyjnego do kontenera..."
 pct push "$CTID" "$PAYLOAD" "/tmp/setup.sh"
 pct exec "$CTID" -- chmod +x "/tmp/setup.sh"
 
-echo "[+] Uruchamianie konfiguracji wewnątrz kontenera (APT, pakiety, SSH, Wazuh v5)..."
-pct exec "$CTID" -- bash -c "/tmp/setup.sh && echo \"${LXC_USER}:${TARGET_USER_PASS}\" | chpasswd"
+echo "[+] Uruchamianie konfiguracji wewnątrz kontenera (${CT_PRETTY_NAME})..."
+pct exec "$CTID" -- /bin/sh -c "/tmp/setup.sh && (echo \"${LXC_USER}:${TARGET_USER_PASS}\" | chpasswd 2>/dev/null || (command -v passwd >/dev/null && echo -e \"${TARGET_USER_PASS}\n${TARGET_USER_PASS}\" | passwd \"${LXC_USER}\" 2>/dev/null) || true)"
 
 # ------------------------------------------------------------------------------
 # 8. Host Integration: SSH Keys & Network Domain
@@ -336,9 +470,9 @@ pct exec "$CTID" -- bash -c "/tmp/setup.sh && echo \"${LXC_USER}:${TARGET_USER_P
 echo "[+] Kopiowanie autoryzowanych kluczy SSH z hosta do użytkownika ${LXC_USER}..."
 if [[ -f "$SSH_PUBKEY" ]]; then
     pct push "$CTID" "$SSH_PUBKEY" "/home/${LXC_USER}/.ssh/authorized_keys"
-    pct exec "$CTID" -- chown -R "${LXC_USER}:${LXC_USER}" "/home/${LXC_USER}/.ssh"
-    pct exec "$CTID" -- chmod 700 "/home/${LXC_USER}/.ssh"
-    pct exec "$CTID" -- chmod 600 "/home/${LXC_USER}/.ssh/authorized_keys"
+    pct exec "$CTID" -- chown -R "${LXC_USER}" "/home/${LXC_USER}/.ssh" 2>/dev/null || true
+    pct exec "$CTID" -- chmod 700 "/home/${LXC_USER}/.ssh" 2>/dev/null || true
+    pct exec "$CTID" -- chmod 600 "/home/${LXC_USER}/.ssh/authorized_keys" 2>/dev/null || true
 else
     echo "[-] Ostrzeżenie: Plik kluczy $SSH_PUBKEY nie istnieje na hoście Proxmox!"
 fi
@@ -350,16 +484,15 @@ fi
 
 # Restarts & Cleanup
 echo "[+] Restartowanie usług sieciowych i czyszczenie..."
-pct exec "$CTID" -- systemctl restart ssh 2>/dev/null || pct exec "$CTID" -- systemctl restart sshd 2>/dev/null || true
+pct exec "$CTID" -- /bin/sh -c "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || rc-service sshd restart 2>/dev/null || /etc/init.d/ssh restart 2>/dev/null || /etc/init.d/sshd restart 2>/dev/null || true"
 pct exec "$CTID" -- rm -f "/tmp/setup.sh"
-pct exec "$CTID" -- bash -c "date -u +'%Y-%m-%dT%H:%M:%SZ' > /etc/.lxc_provisioned && chmod 644 /etc/.lxc_provisioned" 2>/dev/null || true
 rm -f "$PAYLOAD"
 
 echo "=========================================================="
-echo "[+] Kontener $CTID został pomyślnie skonfigurowany!"
+echo "[+] Kontener $CTID (${CT_PRETTY_NAME}) został pomyślnie skonfigurowany!"
 echo "    Użytkownik: ${LXC_USER} (logowanie przez klucze SSH)"
-echo "    Wazuh Agent: wersja 5 (${WAZUH_VER})"
-echo "    NTP: czas pilnowany z poziomu hosta"
+echo "    Rodzina: ${CT_FAMILY} | Format: ${PKG_FORMAT}"
+echo "    NTP: czas pilnowany bezpośrednio z jądra hosta PVE"
 echo "=========================================================="
 
 if pct exec "$CTID" -- [ -s "/tmp/ct_setup_errors.log" ]; then

@@ -145,18 +145,25 @@ nano .env
     - `--dry-run`: Simulate upgrades without modifying packages.
 
 - **`provisioning/nowykontener.sh`** (Single container) & **`provisioning/autoinstall.sh`** (Batch mode):
-  - **OS Compatibility**: Ubuntu, Debian 12 (Bookworm), Debian 13 (Trixie), TurnKey Linux.
+  - **Universal Multi-Distro Support ("Distrohopping-Proof")**:
+    - **Debian / Ubuntu family**: Debian 11/12/13/sid, Ubuntu 20.04/22.04/24.04/24.10, TurnKey Linux, Linux Mint, Pop!_OS, Kali Linux, ParrotOS, Devuan.
+    - **RHEL / Fedora family**: Fedora, Rocky Linux 8/9, AlmaLinux 8/9, CentOS Stream 9, RHEL, Oracle Linux.
+    - **SUSE family**: openSUSE Leap 15.x, openSUSE Tumbleweed, SUSE Linux Enterprise (SLES).
+    - **Arch family**: Arch Linux, Manjaro, EndeavourOS.
+    - **Alpine Linux**: Alpine 3.18+, edge (with OpenRC init support).
+    - **Generic Linux fallback**: Dynamically inspects `/etc/os-release`, package managers (`apt`, `dnf`, `zypper`, `pacman`, `apk`), and init systems.
   - **SSH Hardening**: Disables root login (`PermitRootLogin no`), disables password login (`PasswordAuthentication no`), enables post-quantum key exchange (`sntrup761x25519-sha512@openssh.com`) and ED25519.
-  - **User Configuration**: Creates non-root administrative user (e.g., `hubi`), sets up Fish shell with `fastfetch` and `cowsay`/`fortune`. Supports non-interactive automated password generation when run in background.
-  - **System Hardening**: Installs `ufw`, `fail2ban`, `unattended-upgrades`, `needrestart`, `debsums`, `rkhunter`.
-  - **Wazuh Agent v5 Integration**: Automatically downloads and installs the latest **Wazuh Agent v5** (`5.0.0-beta5`), cached on the host and pushed into the container, registered to `WAZUH_MANAGER` and group `WAZUH_AGENT_GROUP`.
-  - **Host-Managed Clock (No Guest NTP)**: Disables and masks `chrony` and `systemd-timesyncd` inside unprivileged containers. Linux containers directly share the hypervisor kernel clock, avoiding capability errors and redundant external NTP lookups.
+  - **User & Sudo Configuration**: Dynamically creates administrative user (e.g., `hubi`) with correct distro sudo groups (`sudo` vs `wheel`), prefers `fish` shell with fallback to `bash`/`sh`. Supports non-interactive automated password generation when run in background.
+  - **System Hardening**: Installs firewall (`ufw` or `firewalld`), intrusion prevention (`fail2ban`), unattended updates, and integrity tools according to distro ecosystem.
+  - **Wazuh Agent v5 Integration**: Automatically selects and caches either `.deb` or `.rpm` packages on the Proxmox host, pushes to the container, and installs via native package manager (`dpkg`, `rpm`, `dnf`, `zypper`).
+  - **Host-Managed Clock (No Guest NTP)**: Disables and masks redundant NTP services (`chrony`, `systemd-timesyncd`, `ntpd`, OpenRC `chronyd`) inside containers. Linux containers directly share the hypervisor kernel clock, avoiding capability errors and redundant external NTP lookups.
   - **State Tracking**: Statically marks configured containers with `/etc/.lxc_provisioned` and records credentials in `$HASLA_FILE` (`/etc/pve/secrets/.hasla`).
 
 - **`provisioning/lxc-auto-provision-watcher.sh`** & **`system-config/lxc-auto-provision.service`**:
-  - **Automated Container Onboarding Daemon**: Continuously watches for newly created and started LXC containers on the Proxmox VE node.
-  - **Zero-Touch Provisioning**: As soon as a new container boots and reaches operational readiness (systemd active, apt locks released), the daemon automatically runs `nowykontener.sh` in the background.
-  - **Failure Backoff**: Implements smart retry cooldowns to avoid spinning on unsupported operating systems.
+  - **Automated Container Onboarding Daemon**: Continuously watches for newly created and started LXC containers across all Linux distributions.
+  - **Zero-Touch Provisioning**: As soon as a new container boots and reaches operational readiness (systemd or OpenRC initialized, package locks released), the daemon automatically runs `nowykontener.sh` in the background.
+  - **Universal Lock Detection**: Proactively detects locks across APT/dpkg, RPM/dnf, Pacman, and APK before attempting package installation.
+  - **Failure Backoff**: Implements smart retry cooldowns to avoid spinning on containers experiencing transient issues.
   - **Systemd Integration**: Provided as a system service for unattended background operation across node reboots.
 
 - **`provisioning/lxc-provision-hook.sh`**:

@@ -106,16 +106,45 @@ is_container_running() {
 
 is_container_ready() {
     local ctid="$1"
-    # 1. Verify systemd is running inside container
-    if ! pct exec "$ctid" -- test -e /run/systemd/system 2>/dev/null; then
+
+    # 1. Verify init system has mounted /proc and /run inside container
+    if ! pct exec "$ctid" -- test -d /proc/1 2>/dev/null; then
         return 1
     fi
-    # 2. Check if apt / dpkg locks are currently held (e.g. by initial cloud-init or boot scripts)
+
+    # 2. If systemd is running, check if it has finished initial startup
+    if pct exec "$ctid" -- test -d /run/systemd/system 2>/dev/null; then
+        local s_state
+        s_state=$(pct exec "$ctid" -- systemctl is-system-running 2>/dev/null || echo "starting")
+        if [[ "$s_state" == "starting" ]]; then
+            return 1
+        fi
+    fi
+
+    # 3. Check for active package manager locks across distro families
+    # Debian / Ubuntu (dpkg / apt)
     if pct exec "$ctid" -- fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
        pct exec "$ctid" -- fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
        pct exec "$ctid" -- fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
         return 1
     fi
+
+    # RHEL / CentOS / Rocky / Alma / Fedora (rpm / dnf)
+    if pct exec "$ctid" -- fuser /var/lib/rpm/.rpm.lock >/dev/null 2>&1 || \
+       pct exec "$ctid" -- fuser /var/run/dnf.pid >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # Arch Linux (pacman)
+    if pct exec "$ctid" -- test -f /var/lib/pacman/db.lck 2>/dev/null; then
+        return 1
+    fi
+
+    # Alpine Linux (apk)
+    if pct exec "$ctid" -- test -f /lib/apk/db/lock 2>/dev/null; then
+        return 1
+    fi
+
     return 0
 }
 

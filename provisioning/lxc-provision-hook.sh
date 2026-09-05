@@ -63,9 +63,9 @@ case "$PHASE" in
         
         # Run provisioning asynchronously in background to avoid blocking container startup
         (
-            # Wait for systemd to initialize inside container
+            # Wait for container init system to mount /proc inside container
             for _ in {1..30}; do
-                if pct exec "$CTID" -- test -e /run/systemd/system 2>/dev/null; then
+                if pct exec "$CTID" -- test -d /proc/1 2>/dev/null; then
                     break
                 fi
                 sleep 2

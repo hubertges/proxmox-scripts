@@ -377,7 +377,7 @@ update_lxc() {
     fi
 
     local pkg_type="deb-amd64"
-    if [[ "$os_id" =~ ^(rhel|centos|rocky|almalinux|fedora)$ ]]; then
+    if [[ "$os_id" =~ ^(rhel|centos|rocky|almalinux|fedora|ol|amzn|opensuse.*|sles.*)$ ]] || pct exec "$ctid" -- command -v rpm >/dev/null 2>&1; then
         pkg_type="rpm-x86_64"
         [[ "$ct_arch" == "aarch64" ]] && pkg_type="rpm-aarch64"
     else
@@ -424,7 +424,7 @@ update_lxc() {
     if [[ "$pkg_type" == deb* ]]; then
         install_cmd="export DEBIAN_FRONTEND=noninteractive WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; dpkg --force-confdef --force-confold -i ${dest_in_ct} >/tmp/ct_dpkg.log 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -f -y >>/tmp/ct_dpkg.log 2>&1 && dpkg --force-confdef --force-confold -i ${dest_in_ct} >>/tmp/ct_dpkg.log 2>&1)"
     else
-        install_cmd="export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; rpm -Uvh --replacepkgs ${dest_in_ct} >/tmp/ct_dpkg.log 2>&1 || dnf install -y ${dest_in_ct} >>/tmp/ct_dpkg.log 2>&1"
+        install_cmd="export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; rpm -Uvh --replacepkgs ${dest_in_ct} >/tmp/ct_dpkg.log 2>&1 || (command -v dnf >/dev/null 2>&1 && dnf install -y ${dest_in_ct} >>/tmp/ct_dpkg.log 2>&1) || (command -v zypper >/dev/null 2>&1 && zypper --non-interactive install -y ${dest_in_ct} >>/tmp/ct_dpkg.log 2>&1)"
     fi
 
     if pct exec "$ctid" -- bash -c "$install_cmd"; then
@@ -511,7 +511,7 @@ update_vm() {
     if [[ "$os_pkg_family" == "deb" ]]; then
         update_script="export DEBIAN_FRONTEND=noninteractive; curl -fsSL '${BASE_URL}/apt/pool/main/w/wazuh-agent/wazuh-agent_${WAZUH_V5_VER}_amd64.deb' -o /tmp/wazuh-agent-v5.deb && export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}' && systemctl stop wazuh-agent >/dev/null 2>&1 || true && (dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -f -y >/dev/null 2>&1 && dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb >/dev/null 2>&1)) && rm -f /tmp/wazuh-agent-v5.deb && systemctl daemon-reload && systemctl enable wazuh-agent >/dev/null 2>&1 && systemctl restart wazuh-agent >/dev/null 2>&1 && systemctl is-active --quiet wazuh-agent && echo SUCCESS || echo FAILED"
     else
-        update_script="curl -fsSL '${BASE_URL}/yum/wazuh-agent-${WAZUH_V5_VER}.x86_64.rpm' -o /tmp/wazuh-agent-v5.rpm && export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}' && systemctl stop wazuh-agent >/dev/null 2>&1 || true && (rpm -Uvh --replacepkgs /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1 || dnf install -y /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1) && rm -f /tmp/wazuh-agent-v5.rpm && systemctl daemon-reload && systemctl enable wazuh-agent >/dev/null 2>&1 && systemctl restart wazuh-agent >/dev/null 2>&1 && systemctl is-active --quiet wazuh-agent && echo SUCCESS || echo FAILED"
+        update_script="curl -fsSL '${BASE_URL}/yum/wazuh-agent-${WAZUH_V5_VER}.x86_64.rpm' -o /tmp/wazuh-agent-v5.rpm && export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}' && systemctl stop wazuh-agent >/dev/null 2>&1 || true && (rpm -Uvh --replacepkgs /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1 || (command -v dnf >/dev/null 2>&1 && dnf install -y /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1) || (command -v zypper >/dev/null 2>&1 && zypper --non-interactive install -y /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1)) && rm -f /tmp/wazuh-agent-v5.rpm && systemctl daemon-reload && systemctl enable wazuh-agent >/dev/null 2>&1 && systemctl restart wazuh-agent >/dev/null 2>&1 && systemctl is-active --quiet wazuh-agent && echo SUCCESS || echo FAILED"
     fi
 
     local exec_result
