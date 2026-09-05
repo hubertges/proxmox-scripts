@@ -30,10 +30,10 @@ YW="\e[33m"
 CL="\e[0m"
 BFR="\r\033[K"
 
-msg_info()  { echo -ne " ${BL}[INFO]${CL}  $1..."; }
-msg_ok()    { echo -e "${BFR} ${GN}[OK]${CL}    $1"; }
-msg_error() { echo -e "${BFR} ${RD}[ERROR]${CL} $1"; }
-msg_warn()  { echo -e "${BFR} ${YW}[WARN]${CL}  $1"; }
+msg_info()  { echo -ne " ${BL}[INFO]${CL}  $1..." >&2; }
+msg_ok()    { echo -e "${BFR} ${GN}[OK]${CL}    $1" >&2; }
+msg_error() { echo -e "${BFR} ${RD}[ERROR]${CL} $1" >&2; }
+msg_warn()  { echo -e "${BFR} ${YW}[WARN]${CL}  $1" >&2; }
 
 # Load repository environment configuration (.env)
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -212,6 +212,52 @@ select_storage() {
     echo "$selected"
 }
 
+# Helper: Configure native DHCP client (systemd-networkd) inside container
+setup_container_dhcp() {
+    local ctid="$1"
+    msg_info "Activating native DHCP client (systemd-networkd) on CT ${ctid}"
+    for _ in {1..15}; do
+        if pct exec "$ctid" -- test -d /etc 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    pct exec "$ctid" -- bash -c '
+        ip link set dev lo up 2>/dev/null || true
+        ip link set dev eth0 up 2>/dev/null || true
+        mkdir -p /etc/systemd/network
+        cat > /etc/systemd/network/10-eth0.network << "NETEOF"
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+
+[DHCPv4]
+UseDNS=yes
+UseRoutes=yes
+NETEOF
+        chmod 644 /etc/systemd/network/10-eth0.network
+        systemctl unmask systemd-networkd 2>/dev/null || true
+        systemctl enable --now systemd-networkd 2>/dev/null || true
+        systemctl restart systemd-networkd 2>/dev/null || true
+        if command -v networkctl >/dev/null 2>&1; then
+            networkctl reload 2>/dev/null || true
+            networkctl reconfigure eth0 2>/dev/null || true
+        fi
+        if command -v dhclient >/dev/null 2>&1; then
+            dhclient -4 -v -1 eth0 2>/dev/null || true
+        elif command -v dhcpcd >/dev/null 2>&1; then
+            dhcpcd -4 eth0 2>/dev/null || true
+        elif command -v udhcpc >/dev/null 2>&1; then
+            udhcpc -i eth0 -n -q 2>/dev/null || true
+        fi
+    ' 2>/dev/null || true
+    msg_ok "DHCP client running on CT ${ctid}"
+}
+
 # Helper: Fetch dynamic IPv4 & IPv6 leases from ProxNET and freeze them as STATIC in Proxmox VE
 freeze_container_network() {
     local ctid="$1"
@@ -221,50 +267,73 @@ freeze_container_network() {
     local ip4_cidr="" gw4="" ip6_cidr="" gw6=""
     
     # Wait for IPv4 lease
-    for i in {1..30}; do
+    for i in {1..20}; do
         ip4_cidr=$(pct exec "$ctid" -- ip -4 -o addr show dev eth0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)
         if [[ -n "$ip4_cidr" ]]; then
             break
         fi
-        sleep 1
-    done
-
-    # Give IPv6 SLAAC / DHCPv6 a few seconds to finish router solicitation & DAD
-    for i in {1..10}; do
-        ip6_cidr=$(pct exec "$ctid" -- ip -6 -o addr show dev eth0 scope global 2>/dev/null | grep -v 'tentative' | awk '{print $4}' | head -n1 || true)
-        if [[ -n "$ip6_cidr" ]]; then
-            break
+        if [[ $i -eq 5 || $i -eq 10 || $i -eq 15 ]]; then
+            pct exec "$ctid" -- bash -c "
+                ip link set dev eth0 up 2>/dev/null || true
+                systemctl restart systemd-networkd 2>/dev/null || true
+            " 2>/dev/null || true
         fi
         sleep 1
     done
 
-    gw4=$(pct exec "$ctid" -- ip -4 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
-    [[ -z "$gw4" ]] && gw4=$(pct exec "$ctid" -- ip -4 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+    # If no DHCP lease received
+    if [[ -z "$ip4_cidr" ]]; then
+        msg_warn "CT ${ctid} did not receive an IPv4 lease via DHCP on bridge '${bridge}'"
+        local user_ip="" user_gw="" user_dns=""
+        if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
+            if whiptail --backtitle "Proxmox VE Helper Scripts" \
+                --title "DHCP TIMEOUT ON CT ${ctid}" \
+                --yesno "Container ${ctid} did not receive an IPv4 address via DHCP on bridge '${bridge}'.\n\nAssign Static IPv4 now?" 12 65; then
+                user_ip=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Enter Static IPv4 with CIDR (e.g. 192.168.1.50/24):" 9 65 "" --title "STATIC IPV4" 3>&1 1>&2 2>&3 || true)
+                [[ -n "$user_ip" ]] && user_gw=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Enter Gateway IPv4 (e.g. 192.168.1.1):" 9 65 "" --title "GATEWAY IPV4" 3>&1 1>&2 2>&3 || true)
+                user_dns=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Enter DNS Nameservers:" 9 65 "1.1.1.1 8.8.8.8" --title "DNS SERVERS" 3>&1 1>&2 2>&3 || echo "1.1.1.1 8.8.8.8")
+            fi
+        fi
+        if [[ -n "$user_ip" ]]; then
+            ip4_cidr="$user_ip"
+            gw4="$user_gw"
+            nameservers="${user_dns:-1.1.1.1 8.8.8.8}"
+        else
+            msg_error "No IPv4 address available for CT ${ctid}. Check DHCP on bridge '${bridge}'."
+            exit 1
+        fi
+    fi
+
+    # Give IPv6 SLAAC / DHCPv6 a few seconds to finish router solicitation & DAD
+    for i in {1..6}; do
+        ip6_cidr=$(pct exec "$ctid" -- ip -6 -o addr show dev eth0 scope global 2>/dev/null | grep -v 'tentative' | awk '{print $4}' | head -n1 || true)
+        [[ -n "$ip6_cidr" ]] && break
+        sleep 1
+    done
+
+    if [[ -z "$gw4" ]]; then
+        gw4=$(pct exec "$ctid" -- ip -4 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+        [[ -z "$gw4" ]] && gw4=$(pct exec "$ctid" -- ip -4 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+    fi
 
     gw6=$(pct exec "$ctid" -- ip -6 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
     [[ -z "$gw6" ]] && gw6=$(pct exec "$ctid" -- ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
 
     # Capture active DNS nameservers and search domain from DHCP before converting to static
     local nameservers searchdomain
-    nameservers=$(pct exec "$ctid" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
-    searchdomain=$(pct exec "$ctid" -- awk '/^search/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n1 || true)
-    if [[ -z "$nameservers" ]]; then
-        nameservers="1.1.1.1 8.8.8.8"
+    if [[ -z "${nameservers:-}" ]]; then
+        nameservers=$(pct exec "$ctid" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
+        [[ -z "$nameservers" ]] && nameservers="1.1.1.1 8.8.8.8"
     fi
+    searchdomain=$(pct exec "$ctid" -- awk '/^search/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n1 || true)
 
     # CRITICAL: Link-local IPv6 gateway (fe80::...) CANNOT be used in Proxmox gw6 without device scope!
     if [[ "$gw6" =~ ^[fF][eE]80: ]]; then
         gw6=""
     fi
 
-    local net_str="name=eth0,bridge=${bridge},firewall=0"
-    if [[ -n "$ip4_cidr" ]]; then
-        net_str+=",ip=${ip4_cidr}"
-        [[ -n "$gw4" ]] && net_str+=",gw=${gw4}"
-    else
-        net_str+=",ip=dhcp"
-    fi
-
+    local net_str="name=eth0,bridge=${bridge},firewall=0,ip=${ip4_cidr}"
+    [[ -n "$gw4" ]] && net_str+=",gw=${gw4}"
     if [[ -n "$ip6_cidr" ]]; then
         net_str+=",ip6=${ip6_cidr}"
         [[ -n "$gw6" ]] && net_str+=",gw6=${gw6}"
@@ -276,26 +345,14 @@ freeze_container_network() {
 
     # Safeguard: Ensure live interface eth0 is UP, routes are preserved, and DNS nameservers exist
     pct exec "$ctid" -- bash -c "
+        ip link set dev lo up 2>/dev/null || true
         ip link set dev eth0 up 2>/dev/null || true
-        if [[ -n '$ip4_cidr' ]]; then
-            ip -4 addr replace '$ip4_cidr' dev eth0 2>/dev/null || true
-            [[ -n '$gw4' ]] && ip -4 route replace default via '$gw4' dev eth0 2>/dev/null || true
-        fi
-        if [[ -n '$ip6_cidr' ]]; then
-            ip -6 addr replace '$ip6_cidr' dev eth0 2>/dev/null || true
-        fi
-        mkdir -p /etc
-        if ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
-            for ns in $nameservers; do
-                echo \"nameserver \$ns\" >> /etc/resolv.conf
-            done
-            ${searchdomain:+echo \"search $searchdomain\" >> /etc/resolv.conf}
-        fi
-    " 2>/dev/null || true
+        ip -4 addr replace '${ip4_cidr}' dev eth0 2>/dev/null || true
+        ${gw4:+ip -4 route replace default via '${gw4}' dev eth0 2>/dev/null || true}
+        ${ip6_cidr:+ip -6 addr replace '${ip6_cidr}' dev eth0 2>/dev/null || true}
 
-    # Write permanent /etc/network/interfaces inside container as backup
-    if [[ -n "$ip4_cidr" ]]; then
-        pct exec "$ctid" -- bash -c "cat > /etc/network/interfaces << 'IFEOF'
+        # Write permanent /etc/network/interfaces inside container as backup
+        cat > /etc/network/interfaces << 'IFEOF'
 auto lo
 iface lo inet loopback
 
@@ -305,8 +362,27 @@ iface eth0 inet static
     ${gw4:+gateway ${gw4}}
 ${ip6_cidr:+iface eth0 inet6 static
     address ${ip6_cidr}}
-IFEOF" 2>/dev/null || true
-    fi
+IFEOF
+
+        # Write permanent /etc/systemd/network/10-eth0.network
+        mkdir -p /etc/systemd/network
+        cat > /etc/systemd/network/10-eth0.network << 'NETEOF'
+[Match]
+Name=eth0
+
+[Network]
+Address=${ip4_cidr}
+${gw4:+Gateway=${gw4}}
+DNS=${nameservers}
+NETEOF
+
+        mkdir -p /etc
+        > /etc/resolv.conf
+        for ns in ${nameservers}; do
+            echo \"nameserver \$ns\" >> /etc/resolv.conf
+        done
+        ${searchdomain:+echo \"search ${searchdomain}\" >> /etc/resolv.conf}
+    " 2>/dev/null || true
 
     local ret_ip4="${ip4_cidr%%/*}"
     local ret_ip6="${ip6_cidr%%/*}"
@@ -407,7 +483,7 @@ create_container() {
     --swap 512 \
     --storage "${STORAGE}" \
     --rootfs "${STORAGE}:${disk}" \
-    --net0 "name=eth0,bridge=${BRIDGE},firewall=0,ip=dhcp,ip6=auto" \
+    --net0 "name=eth0,bridge=${BRIDGE},firewall=0,ip=dhcp" \
     --net1 "${net1_param}" \
     --ostype ubuntu \
     --unprivileged 0 \
@@ -432,6 +508,7 @@ start_container() {
     ((retries--))
   done
   msg_ok "Container ${ctid} is running"
+  setup_container_dhcp "${ctid}"
 }
 
 exec_in_ct() {
