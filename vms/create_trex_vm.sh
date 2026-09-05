@@ -38,41 +38,136 @@ if ! command -v jq >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || true
 fi
 
-# Helper: Query PVE storage pools safely without requiring jq
-get_pve_storage() {
-    local content="$1"
-    local storages=()
+# Helper: Query local active PVE storage pools safely (filtering by node affinity and active status)
+get_local_pve_storages() {
+    local content_type="$1"
+    local -a list=()
 
-    if command -v jq >/dev/null 2>&1; then
-        mapfile -t storages < <(pvesh get /storage --output-format json 2>/dev/null | jq -r ".[] | select(.content | contains(\"${content}\")) | .storage" 2>/dev/null || true)
+    if command -v pvesm >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            local s_name s_type s_status _ _ s_avail _
+            read -r s_name s_type s_status _ _ s_avail _ <<< "$line"
+            if [[ -n "$s_name" && "$s_name" != "Name" ]]; then
+                if [[ "$s_status" == "active" || -z "$s_status" ]]; then
+                    list+=("$s_name $s_type ${s_avail:-0}")
+                fi
+            fi
+        done < <(pvesm status -content "$content_type" 2>/dev/null || true)
     fi
 
-    if [[ ${#storages[@]} -eq 0 ]] && command -v perl >/dev/null 2>&1; then
-        mapfile -t storages < <(pvesh get /storage --output-format json 2>/dev/null | perl -MJSON::PP -e '
-            my $target = shift;
-            local $/;
-            my $raw = <STDIN>;
-            eval {
-                my $data = decode_json($raw);
-                for my $s (@$data) {
-                    if (exists $s->{content} && index($s->{content}, $target) != -1) {
-                        print $s->{storage} . "\n";
-                    }
+    if [[ ${#list[@]} -eq 0 && -f /etc/pve/storage.cfg ]]; then
+        local my_node
+        my_node=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && list+=("$line")
+        done < <(awk -v c="$content_type" -v node="$my_node" '
+            /^[a-z0-9_-]+:[[:space:]]+/ {
+                cur = $2
+                sub(/^[a-z0-9_-]+:[[:space:]]*/, "", cur)
+                sub(/[[:space:]].*$/, "", cur)
+                has_content = 0
+                node_match = 1
+                disabled = 0
+            }
+            /^[[:space:]]+disable/ { disabled = 1 }
+            /^[[:space:]]+nodes[[:space:]]+/ {
+                nodes_list = $0
+                sub(/^[[:space:]]+nodes[[:space:]]+/, "", nodes_list)
+                if (node != "" && nodes_list !~ "(^|,)" node "(,|$)") {
+                    node_match = 0
                 }
-            };
-        ' "$content" 2>/dev/null || true)
-    fi
-
-    if [[ ${#storages[@]} -eq 0 && -f /etc/pve/storage.cfg ]]; then
-        mapfile -t storages < <(awk -v c="$content" '
-            /^[a-z0-9_-]+: / { cur = $2 }
-            cur && $1 == "content" && $0 ~ c { print cur }
+            }
+            /^[[:space:]]+content[[:space:]]+/ {
+                if ($0 ~ c) has_content = 1
+            }
+            cur && has_content && node_match && !disabled {
+                print cur " local active 0 0 0 0%"
+                has_content = 0
+            }
         ' /etc/pve/storage.cfg 2>/dev/null || true)
     fi
 
-    for s in "${storages[@]}"; do
-        [[ -n "$s" ]] && echo "$s"
+    for item in "${list[@]}"; do
+        echo "$item"
     done
+}
+
+# Helper: Interactive Whiptail Storage Radiolist Menu (Community-Scripts Standard)
+select_storage() {
+    local content_type="$1"
+    local title="$2"
+    local default_stor="${3:-}"
+
+    local -a storage_lines=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && storage_lines+=("$line")
+    done < <(get_local_pve_storages "$content_type")
+
+    local count=${#storage_lines[@]}
+    if [[ $count -eq 0 ]]; then
+        echo "${default_stor:-local}"
+        return
+    fi
+
+    if [[ $count -eq 1 ]]; then
+        local single_name
+        read -r single_name _ <<< "${storage_lines[0]}"
+        echo "$single_name"
+        return
+    fi
+
+    if ! command -v whiptail >/dev/null 2>&1 || [[ ! -t 0 ]]; then
+        if [[ -n "$default_stor" ]]; then
+            for line in "${storage_lines[@]}"; do
+                local s_name
+                read -r s_name _ <<< "$line"
+                if [[ "$s_name" == "$default_stor" ]]; then
+                    echo "$default_stor"
+                    return
+                fi
+            done
+        fi
+        local first_name
+        read -r first_name _ <<< "${storage_lines[0]}"
+        echo "$first_name"
+        return
+    fi
+
+    local menu_items=()
+    local first=1
+    for line in "${storage_lines[@]}"; do
+        local s_name s_type s_avail_raw
+        read -r s_name s_type s_avail_raw <<< "$line"
+        local s_free="N/A"
+        if [[ -n "$s_avail_raw" && "$s_avail_raw" =~ ^[0-9]+$ && "$s_avail_raw" -gt 0 ]]; then
+            s_free=$(numfmt --to=iec --from-unit=K "$s_avail_raw" 2>/dev/null || echo "${s_avail_raw}K")
+        fi
+
+        local is_on="OFF"
+        if [[ -n "$default_stor" && "$s_name" == "$default_stor" ]]; then
+            is_on="ON"
+        elif [[ -z "$default_stor" && $first -eq 1 ]]; then
+            is_on="ON"
+            first=0
+        fi
+
+        menu_items+=("$s_name" "Type: ${s_type} | Free: ${s_free}" "$is_on")
+    done
+
+    local selected
+    selected=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
+        --title "$title" \
+        --radiolist "Select storage pool on node '$(hostname)':" \
+        16 68 $((count > 8 ? 8 : count)) \
+        "${menu_items[@]}" 3>&1 1>&2 2>&3) || true
+
+    if [[ -z "$selected" ]]; then
+        local first_name
+        read -r first_name _ <<< "${storage_lines[0]}"
+        selected="$first_name"
+    fi
+
+    echo "$selected"
 }
 
 header_info() {
@@ -139,10 +234,7 @@ RAM_MB=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Allocate RAM
 RAM_MB="${RAM_MB:-8192}"
 
 # Storage selection
-mapfile -t STORAGE_LIST < <(get_pve_storage "images")
-STORAGE_DEF="${DEFAULT_STORAGE:-${STORAGE_LIST[0]:-local-lvm}}"
-STORAGE=$(whiptail --backtitle "Proxmox TRex Deployment" --inputbox "Target Storage Pool for Disk:" 8 58 "$STORAGE_DEF" --title "STORAGE POOL" 3>&1 1>&2 2>&3 || echo "$STORAGE_DEF")
-STORAGE="${STORAGE:-$STORAGE_DEF}"
+STORAGE=$(select_storage "images" "Select Storage for VM Disk" "${DEFAULT_STORAGE:-}")
 
 CI_USER="${TREX_CI_USER:-trex}"
 CI_PASS="${TREX_CI_PASSWORD:-cisco123}"
