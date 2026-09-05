@@ -18,11 +18,11 @@ RED="\033[0;31m"
 CYAN="\033[0;36m"
 NC="\033[0m"
 
-log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_ok()      { echo -e "${GREEN}[OK]${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1" >&2; }
+log_ok()      { echo -e "${GREEN}[OK]${NC} $1" >&2; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 log_err()     { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-log_step()    { echo -e "\n${BOLD}${CYAN}===> $1${NC}"; }
+log_step()    { echo -e "\n${BOLD}${CYAN}===> $1${NC}" >&2; }
 
 # ------------------------------------------------------------------------------
 # 1. Environment & Configuration Loading
@@ -219,11 +219,17 @@ update_host() {
     fi
 
     local pkg_path
-    pkg_path=$(ensure_cached_package "$pkg_type") || {
+    pkg_path=$(ensure_cached_package "$pkg_type" | tail -n 1) || {
         log_err "Host update failed: Could not retrieve installer package."
         SUMMARY_FAILED+=("Host: $(hostname)")
         return 1
     }
+
+    if [[ ! -f "$pkg_path" ]]; then
+        log_err "Installer package not found at: '$pkg_path'"
+        SUMMARY_FAILED+=("Host: $(hostname) [missing pkg]")
+        return 1
+    fi
 
     # Backup existing configuration and authentication keys
     if [[ -f /var/ossec/etc/ossec.conf ]]; then
@@ -379,11 +385,17 @@ update_lxc() {
     fi
 
     local pkg_path
-    pkg_path=$(ensure_cached_package "$pkg_type") || {
+    pkg_path=$(ensure_cached_package "$pkg_type" | tail -n 1) || {
         log_err "Failed to prepare package for CT ${ctid}."
         SUMMARY_FAILED+=("CT ${ctid} (${ct_name}) [pkg download]")
         return 1
     }
+
+    if [[ ! -f "$pkg_path" ]]; then
+        log_err "Installer package not found at: '$pkg_path'"
+        SUMMARY_FAILED+=("CT ${ctid} (${ct_name}) [missing pkg]")
+        return 1
+    fi
 
     # Step upgrade check for Debian/Ubuntu LXCs
     if [[ "$pkg_type" == deb* && "$CLEAN_INSTALL" -eq 0 ]]; then
