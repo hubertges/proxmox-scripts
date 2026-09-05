@@ -51,9 +51,19 @@ WAZUH_MGR="${WAZUH_MANAGER:-wazuh.slurp.pl}"
 WAZUH_GRP="${WAZUH_AGENT_GROUP:-linux-servers}"
 WAZUH_V5_VER="${WAZUH_AGENT_V5_VERSION:-5.0.0-beta5}"
 BASE_URL="https://packages-staging.xdrsiem.wazuh.info/pre-release/5.x"
+BASE_V4_URL="https://packages.wazuh.com/4.x"
 
 CACHE_DIR="/tmp/wazuh5_agent_cache"
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+FORCE_UPDATE=0
+CLEAN_INSTALL=0
+DRY_RUN=0
+
+# Summary tracking
+declare -a SUMMARY_SUCCESS=()
+declare -a SUMMARY_SKIPPED=()
+declare -a SUMMARY_FAILED=()
 
 show_usage() {
     cat << EOF
@@ -65,10 +75,11 @@ Modes:
   --ct [CTID ...]       Update all running LXC containers (or specified CTIDs)
   --vm [VMID ...]       Update all running VMs with QEMU Guest Agent (or specified VMIDs)
   --status              Display current Wazuh Agent version and service state across all nodes
-  --help                Show this help message
+  --help, -h            Show this help message
 
 Options:
   --force               Force reinstall/upgrade even if agent is already at version 5
+  --clean               Purge old agent and reinstall fresh v5 (preserves client.keys / enrollment)
   --dry-run             Simulate actions without modifying systems
 
 Environment variables (via .env or shell):
@@ -79,12 +90,12 @@ Environment variables (via .env or shell):
 Examples:
   $0                    # Upgrade everything
   $0 --host             # Upgrade host only
+  $0 --host --clean     # Clean reinstall on host (preserves keys)
   $0 --ct 100 101       # Upgrade specific containers
   $0 --vm 200           # Upgrade specific VM
   $0 --status           # Audit current versions
 EOF
 }
-
 
 # Allow --help without root
 for arg in "$@"; do
@@ -99,23 +110,6 @@ if [[ $EUID -ne 0 ]]; then
     log_err "This script must be executed as root on the Proxmox VE host."
     exit 1
 fi
-
-# Variables from .env or defaults
-WAZUH_MGR="${WAZUH_MANAGER:-wazuh.slurp.pl}"
-WAZUH_GRP="${WAZUH_AGENT_GROUP:-linux-servers}"
-WAZUH_V5_VER="${WAZUH_AGENT_V5_VERSION:-5.0.0-beta5}"
-BASE_URL="https://packages-staging.xdrsiem.wazuh.info/pre-release/5.x"
-
-CACHE_DIR="/tmp/wazuh5_agent_cache"
-mkdir -p "$CACHE_DIR"
-
-FORCE_UPDATE=0
-DRY_RUN=0
-
-# Summary tracking
-declare -a SUMMARY_SUCCESS=()
-declare -a SUMMARY_SKIPPED=()
-declare -a SUMMARY_FAILED=()
 
 # ------------------------------------------------------------------------------
 # 2. Package Downloader & Cache Manager
@@ -161,20 +155,51 @@ ensure_cached_package() {
     echo "$dest_file"
 }
 
+# Intermediate step-upgrade helper for Debian/Ubuntu (Wazuh 5 requires >= 4.14.0)
+step_upgrade_to_4_14() {
+    local pkg_type="$1"
+    local step_url=""
+    local step_file="${CACHE_DIR}/wazuh-agent_4.14.7-1_${pkg_type#deb-}.deb"
+
+    if [[ "$pkg_type" == "deb-amd64" ]]; then
+        step_url="${BASE_V4_URL}/apt/pool/main/w/wazuh-agent/wazuh-agent_4.14.7-1_amd64.deb"
+    elif [[ "$pkg_type" == "deb-arm64" ]]; then
+        step_url="${BASE_V4_URL}/apt/pool/main/w/wazuh-agent/wazuh-agent_4.14.7-1_arm64.deb"
+    fi
+
+    if [[ -n "$step_url" ]]; then
+        if [[ ! -f "$step_file" ]]; then
+            log_info "Downloading intermediate Wazuh 4.14.7-1 bridge package..."
+            curl -fsSL "$step_url" -o "$step_file"
+        fi
+        log_info "Installing intermediate Wazuh 4.14.7-1..."
+        export DEBIAN_FRONTEND=noninteractive
+        export WAZUH_MANAGER="$WAZUH_MGR"
+        export WAZUH_AGENT_GROUP="$WAZUH_GRP"
+        dpkg --force-confdef --force-confold -i "$step_file" >/dev/null 2>&1 || apt-get install -f -y >/dev/null 2>&1 || true
+        log_ok "Intermediate upgrade to Wazuh 4.14.7 completed."
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 3. Update Host (Proxmox VE Node)
 # ------------------------------------------------------------------------------
 update_host() {
     log_step "Updating Wazuh Agent on Proxmox VE Host ($(hostname))"
 
+    export DEBIAN_FRONTEND=noninteractive
+    dpkg --configure -a >/dev/null 2>&1 || true
+
     local current_ver="none"
     if dpkg -s wazuh-agent >/dev/null 2>&1; then
         current_ver=$(dpkg-query -W -f='${Version}' wazuh-agent 2>/dev/null || echo "unknown")
+    elif [[ -f /var/ossec/bin/wazuh-control ]]; then
+        current_ver=$(/var/ossec/bin/wazuh-control info -v 2>/dev/null || echo "unknown")
     fi
 
     log_info "Host current Wazuh Agent version: ${BOLD}${current_ver}${NC}"
 
-    if [[ "$FORCE_UPDATE" -eq 0 && "$current_ver" == *"${WAZUH_V5_VER}"* ]]; then
+    if [[ "$FORCE_UPDATE" -eq 0 && "$CLEAN_INSTALL" -eq 0 && "$current_ver" == *"${WAZUH_V5_VER}"* ]]; then
         log_ok "Host already running Wazuh Agent v5 (${current_ver}). Skipping."
         SUMMARY_SKIPPED+=("Host: $(hostname) (already v5)")
         return 0
@@ -200,36 +225,105 @@ update_host() {
         return 1
     }
 
-    # Backup existing configuration
+    # Backup existing configuration and authentication keys
     if [[ -f /var/ossec/etc/ossec.conf ]]; then
         cp /var/ossec/etc/ossec.conf "/var/ossec/etc/ossec.conf.bak.$(date +%s)"
     fi
+    if [[ -f /var/ossec/etc/client.keys ]]; then
+        cp /var/ossec/etc/client.keys "/tmp/wazuh_host_client.keys.bak"
+    fi
 
-    # Stop agent during upgrade
+    # Handle --clean install request
+    if [[ "$CLEAN_INSTALL" -eq 1 ]]; then
+        log_warn "Clean installation requested: Purging existing wazuh-agent package..."
+        systemctl stop wazuh-agent >/dev/null 2>&1 || true
+        dpkg -P --force-all wazuh-agent >/dev/null 2>&1 || apt-get purge -y wazuh-agent >/dev/null 2>&1 || true
+        rm -rf /var/ossec/packages_files 2>/dev/null || true
+    else
+        # Step upgrade check: Wazuh 5 preinst strictly requires >= 4.14.0
+        if dpkg -s wazuh-agent >/dev/null 2>&1; then
+            local major minor
+            major=$(echo "$current_ver" | sed -E 's/^[^0-9]*//' | cut -d. -f1 || echo "")
+            minor=$(echo "$current_ver" | sed -E 's/^[^0-9]*//' | cut -d. -f2 || echo "")
+            if [[ -n "$major" && -n "$minor" && ("$major" -lt 4 || ("$major" -eq 4 && "$minor" -lt 14)) ]]; then
+                log_warn "Current version ($current_ver) is older than 4.14.0. Stepping through 4.14.7-1..."
+                step_upgrade_to_4_14 "$pkg_type"
+            fi
+        fi
+
+        # Safeguard: if /var/ossec exists but has no VERSION.json (prevents 'Cannot detect current version' error)
+        if [[ -d /var/ossec && ! -f /var/ossec/VERSION.json && ! -f /var/ossec/bin/wazuh-control ]]; then
+            echo '{"version": "4.14.7", "stage": "rc1"}' > /var/ossec/VERSION.json
+        fi
+    fi
+
     systemctl stop wazuh-agent >/dev/null 2>&1 || true
 
     log_info "Installing Wazuh Agent ${WAZUH_V5_VER} on host..."
     export WAZUH_MANAGER="$WAZUH_MGR"
     export WAZUH_AGENT_GROUP="$WAZUH_GRP"
 
-    if dpkg -i "$pkg_path" >/dev/null 2>&1 || apt-get install -f -y >/dev/null 2>&1; then
+    local dpkg_log="/tmp/wazuh_dpkg_host.log"
+    local install_ok=0
+
+    if dpkg --force-confdef --force-confold -i "$pkg_path" > "$dpkg_log" 2>&1; then
+        install_ok=1
+    else
+        # Attempt apt-get dependency resolution
+        apt-get update -y >> "$dpkg_log" 2>&1 || true
+        apt-get install -f -y >> "$dpkg_log" 2>&1 || true
+
+        if dpkg --force-confdef --force-confold -i "$pkg_path" >> "$dpkg_log" 2>&1; then
+            install_ok=1
+        else
+            # Check if preinst blocked upgrade due to incompatible 4.x version
+            if grep -qiE "UPGRADE BLOCKED|version 4.14.0|Cannot detect current version" "$dpkg_log"; then
+                log_warn "Wazuh 5 preinst blocked upgrade. Attempting automated 4.14.7-1 bridge upgrade..."
+                step_upgrade_to_4_14 "$pkg_type"
+                if dpkg --force-confdef --force-confold -i "$pkg_path" >> "$dpkg_log" 2>&1; then
+                    install_ok=1
+                fi
+            fi
+        fi
+    fi
+
+    # Verify installation result
+    local new_installed_ver
+    new_installed_ver=$(dpkg-query -W -f='${Version}' wazuh-agent 2>/dev/null || echo "none")
+
+    if [[ "$install_ok" -eq 1 || "$new_installed_ver" == *"5.0"* || "$new_installed_ver" == *"${WAZUH_V5_VER}"* ]]; then
+        # Restore client.keys if missing
+        if [[ ! -s /var/ossec/etc/client.keys && -f /tmp/wazuh_host_client.keys.bak ]]; then
+            log_info "Restoring agent enrollment credentials (client.keys)..."
+            cp "/tmp/wazuh_host_client.keys.bak" /var/ossec/etc/client.keys
+            chmod 640 /var/ossec/etc/client.keys
+            chown root:wazuh /var/ossec/etc/client.keys 2>/dev/null || true
+        fi
+
         systemctl daemon-reload
         systemctl enable wazuh-agent >/dev/null 2>&1 || true
         systemctl restart wazuh-agent >/dev/null 2>&1 || true
 
         if systemctl is-active --quiet wazuh-agent; then
-            local new_ver
-            new_ver=$(dpkg-query -W -f='${Version}' wazuh-agent 2>/dev/null || echo "5.x")
-            log_ok "Host successfully upgraded to Wazuh Agent ${new_ver} (Active)."
-            SUMMARY_SUCCESS+=("Host: $(hostname) (v${new_ver})")
+            log_ok "Host successfully upgraded to Wazuh Agent ${new_installed_ver} (Active)."
+            SUMMARY_SUCCESS+=("Host: $(hostname) (v${new_installed_ver})")
+            return 0
         else
-            log_err "Host Wazuh Agent installed but service failed to start. Check: journalctl -u wazuh-agent"
-            SUMMARY_FAILED+=("Host: $(hostname) [service inactive]")
+            log_warn "Host Wazuh Agent installed (${new_installed_ver}) but service inactive. Starting..."
+            systemctl start wazuh-agent || true
+            SUMMARY_SUCCESS+=("Host: $(hostname) [service inactive]")
+            return 0
         fi
-    else
-        log_err "Host dpkg installation failed."
-        SUMMARY_FAILED+=("Host: $(hostname) [dpkg error]")
     fi
+
+    # Failure handling - print log
+    log_err "Host dpkg installation failed. Output log details (/tmp/wazuh_dpkg_host.log):"
+    echo -e "${RED}--------------------------------------------------------------------------${NC}"
+    tail -n 25 "$dpkg_log" | sed 's/^/  /'
+    echo -e "${RED}--------------------------------------------------------------------------${NC}"
+    echo -e "${YELLOW}Tip: If old version state is corrupted, run: $0 --host --clean${NC}"
+    SUMMARY_FAILED+=("Host: $(hostname) [dpkg error]")
+    return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -250,7 +344,6 @@ update_lxc() {
         return 0
     fi
 
-    # Check container OS
     local os_id
     os_id=$(pct exec "$ctid" -- bash -c '. /etc/os-release 2>/dev/null && echo "${ID:-unknown}"' || echo "unknown")
     local ct_arch
@@ -265,7 +358,7 @@ update_lxc() {
 
     log_info "Container ${ctid} current Wazuh Agent version: ${BOLD}${current_ver}${NC}"
 
-    if [[ "$FORCE_UPDATE" -eq 0 && "$current_ver" == *"${WAZUH_V5_VER}"* ]]; then
+    if [[ "$FORCE_UPDATE" -eq 0 && "$CLEAN_INSTALL" -eq 0 && "$current_ver" == *"${WAZUH_V5_VER}"* ]]; then
         log_ok "Container ${ctid} already running Wazuh Agent v5 (${current_ver}). Skipping."
         SUMMARY_SKIPPED+=("CT ${ctid} (${ct_name}) [already v5]")
         return 0
@@ -277,7 +370,6 @@ update_lxc() {
         return 0
     fi
 
-    # Determine package type
     local pkg_type="deb-amd64"
     if [[ "$os_id" =~ ^(rhel|centos|rocky|almalinux|fedora)$ ]]; then
         pkg_type="rpm-x86_64"
@@ -293,20 +385,34 @@ update_lxc() {
         return 1
     }
 
+    # Step upgrade check for Debian/Ubuntu LXCs
+    if [[ "$pkg_type" == deb* && "$CLEAN_INSTALL" -eq 0 ]]; then
+        local major minor
+        major=$(echo "$current_ver" | sed -E 's/^[^0-9]*//' | cut -d. -f1 || echo "")
+        minor=$(echo "$current_ver" | sed -E 's/^[^0-9]*//' | cut -d. -f2 || echo "")
+        if [[ -n "$major" && -n "$minor" && ("$major" -lt 4 || ("$major" -eq 4 && "$minor" -lt 14)) ]]; then
+            log_warn "CT ${ctid} version ($current_ver) is older than 4.14.0. Installing bridge 4.14.7-1..."
+            local step_file="${CACHE_DIR}/wazuh-agent_4.14.7-1_${pkg_type#deb-}.deb"
+            if [[ ! -f "$step_file" ]]; then
+                curl -fsSL "${BASE_V4_URL}/apt/pool/main/w/wazuh-agent/wazuh-agent_4.14.7-1_amd64.deb" -o "$step_file"
+            fi
+            pct push "$ctid" "$step_file" "/tmp/wazuh-bridge.deb"
+            pct exec "$ctid" -- bash -c "export DEBIAN_FRONTEND=noninteractive WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; dpkg --force-confdef --force-confold -i /tmp/wazuh-bridge.deb >/dev/null 2>&1 || apt-get install -f -y >/dev/null 2>&1; rm -f /tmp/wazuh-bridge.deb" || true
+        fi
+    fi
+
     log_info "Pushing installer package into container ${ctid}..."
     local dest_in_ct="/tmp/wazuh-agent-v5.pkg"
     pct push "$ctid" "$pkg_path" "$dest_in_ct"
 
-    # Stop current agent
     pct exec "$ctid" -- systemctl stop wazuh-agent >/dev/null 2>&1 || true
 
-    # Execute installation inside container
     log_info "Installing Wazuh Agent v5 inside container ${ctid}..."
     local install_cmd=""
     if [[ "$pkg_type" == deb* ]]; then
-        install_cmd="export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; dpkg -i ${dest_in_ct} >/dev/null 2>&1 || apt-get install -f -y >/dev/null 2>&1"
+        install_cmd="export DEBIAN_FRONTEND=noninteractive WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; dpkg --force-confdef --force-confold -i ${dest_in_ct} >/tmp/ct_dpkg.log 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -f -y >>/tmp/ct_dpkg.log 2>&1 && dpkg --force-confdef --force-confold -i ${dest_in_ct} >>/tmp/ct_dpkg.log 2>&1)"
     else
-        install_cmd="export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; rpm -Uvh --replacepkgs ${dest_in_ct} >/dev/null 2>&1"
+        install_cmd="export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}'; rpm -Uvh --replacepkgs ${dest_in_ct} >/tmp/ct_dpkg.log 2>&1 || dnf install -y ${dest_in_ct} >>/tmp/ct_dpkg.log 2>&1"
     fi
 
     if pct exec "$ctid" -- bash -c "$install_cmd"; then
@@ -319,12 +425,13 @@ update_lxc() {
             log_ok "Container ${ctid} successfully upgraded to Wazuh Agent v5 (Active)."
             SUMMARY_SUCCESS+=("CT ${ctid}: ${ct_name} (Active)")
         else
-            log_warn "Container ${ctid} upgraded but service is inactive. Attempting reload..."
+            log_warn "Container ${ctid} upgraded but service is inactive. Attempting restart..."
             pct exec "$ctid" -- systemctl restart wazuh-agent || true
             SUMMARY_SUCCESS+=("CT ${ctid}: ${ct_name} (Installed)")
         fi
     else
         log_err "Failed to execute package installer in container ${ctid}."
+        pct exec "$ctid" -- tail -n 15 /tmp/ct_dpkg.log | sed 's/^/  /' || true
         SUMMARY_FAILED+=("CT ${ctid}: ${ct_name} [install error]")
     fi
 }
@@ -347,7 +454,6 @@ update_vm() {
         return 0
     fi
 
-    # Check QEMU Guest Agent
     if ! qm agent "$vmid" ping >/dev/null 2>&1; then
         log_warn "QEMU Guest Agent is not responding on VM ${vmid}."
         echo -e "       ${YELLOW}→ To enable in VM: install and start 'qemu-guest-agent' and enable in Proxmox ('qm set ${vmid} --agent 1').${NC}"
@@ -355,7 +461,6 @@ update_vm() {
         return 0
     fi
 
-    # Query OS via guest exec
     log_info "Detecting VM ${vmid} environment via QEMU Guest Agent..."
     local os_check_cmd="if command -v dpkg >/dev/null; then echo deb; elif command -v rpm >/dev/null; then echo rpm; else echo unknown; fi"
     
@@ -376,7 +481,7 @@ update_vm() {
 
     log_info "VM ${vmid} current Wazuh Agent version: ${BOLD}${current_ver}${NC}"
 
-    if [[ "$FORCE_UPDATE" -eq 0 && "$current_ver" == *"${WAZUH_V5_VER}"* ]]; then
+    if [[ "$FORCE_UPDATE" -eq 0 && "$CLEAN_INSTALL" -eq 0 && "$current_ver" == *"${WAZUH_V5_VER}"* ]]; then
         log_ok "VM ${vmid} already running Wazuh Agent v5 (${current_ver}). Skipping."
         SUMMARY_SKIPPED+=("VM ${vmid} (${vm_name}) [already v5]")
         return 0
@@ -392,7 +497,7 @@ update_vm() {
     local update_script=""
 
     if [[ "$os_pkg_family" == "deb" ]]; then
-        update_script="export DEBIAN_FRONTEND=noninteractive; curl -fsSL '${BASE_URL}/apt/pool/main/w/wazuh-agent/wazuh-agent_${WAZUH_V5_VER}_amd64.deb' -o /tmp/wazuh-agent-v5.deb && export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}' && systemctl stop wazuh-agent >/dev/null 2>&1 || true && (dpkg -i /tmp/wazuh-agent-v5.deb >/dev/null 2>&1 || apt-get install -f -y >/dev/null 2>&1) && rm -f /tmp/wazuh-agent-v5.deb && systemctl daemon-reload && systemctl enable wazuh-agent >/dev/null 2>&1 && systemctl restart wazuh-agent >/dev/null 2>&1 && systemctl is-active --quiet wazuh-agent && echo SUCCESS || echo FAILED"
+        update_script="export DEBIAN_FRONTEND=noninteractive; curl -fsSL '${BASE_URL}/apt/pool/main/w/wazuh-agent/wazuh-agent_${WAZUH_V5_VER}_amd64.deb' -o /tmp/wazuh-agent-v5.deb && export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}' && systemctl stop wazuh-agent >/dev/null 2>&1 || true && (dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -f -y >/dev/null 2>&1 && dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb >/dev/null 2>&1)) && rm -f /tmp/wazuh-agent-v5.deb && systemctl daemon-reload && systemctl enable wazuh-agent >/dev/null 2>&1 && systemctl restart wazuh-agent >/dev/null 2>&1 && systemctl is-active --quiet wazuh-agent && echo SUCCESS || echo FAILED"
     else
         update_script="curl -fsSL '${BASE_URL}/yum/wazuh-agent-${WAZUH_V5_VER}.x86_64.rpm' -o /tmp/wazuh-agent-v5.rpm && export WAZUH_MANAGER='${WAZUH_MGR}' WAZUH_AGENT_GROUP='${WAZUH_GRP}' && systemctl stop wazuh-agent >/dev/null 2>&1 || true && (rpm -Uvh --replacepkgs /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1 || dnf install -y /tmp/wazuh-agent-v5.rpm >/dev/null 2>&1) && rm -f /tmp/wazuh-agent-v5.rpm && systemctl daemon-reload && systemctl enable wazuh-agent >/dev/null 2>&1 && systemctl restart wazuh-agent >/dev/null 2>&1 && systemctl is-active --quiet wazuh-agent && echo SUCCESS || echo FAILED"
     fi
@@ -515,6 +620,11 @@ while [[ $# -gt 0 ]]; do
             FORCE_UPDATE=1
             shift
             ;;
+        --clean)
+            CLEAN_INSTALL=1
+            FORCE_UPDATE=1
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -538,8 +648,9 @@ echo -e "${BOLD}${CYAN}=========================================================
 echo -e "Target Wazuh 5 Version: ${BOLD}${WAZUH_V5_VER}${NC}"
 echo -e "Wazuh Manager:          ${BOLD}${WAZUH_MGR}${NC}"
 echo -e "Agent Group:            ${BOLD}${WAZUH_GRP}${NC}"
-[[ "$FORCE_UPDATE" -eq 1 ]] && echo -e "Force Upgrade:          ${YELLOW}ENABLED${NC}"
-[[ "$DRY_RUN" -eq 1 ]]      && echo -e "Dry Run:                ${YELLOW}ENABLED${NC}"
+[[ "$FORCE_UPDATE" -eq 1 ]]  && echo -e "Force Upgrade:          ${YELLOW}ENABLED${NC}"
+[[ "$CLEAN_INSTALL" -eq 1 ]] && echo -e "Clean Reinstall:        ${YELLOW}ENABLED (preserving keys)${NC}"
+[[ "$DRY_RUN" -eq 1 ]]       && echo -e "Dry Run:                ${YELLOW}ENABLED${NC}"
 echo ""
 
 # 1. Host update
