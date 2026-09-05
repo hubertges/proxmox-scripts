@@ -29,6 +29,19 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ------------------------------------------------------------------------------
+# Network & DNS Verification Safeguard
+# ------------------------------------------------------------------------------
+ip link set dev lo up 2>/dev/null || true
+ip link set dev eth0 up 2>/dev/null || true
+
+# Ensure working DNS resolution in /etc/resolv.conf
+if ! grep -q "^nameserver" /etc/resolv.conf 2>/dev/null; then
+    log_warn "Empty /etc/resolv.conf detected! Adding public fallback DNS servers..."
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+fi
+
+# ------------------------------------------------------------------------------
 # Configuration Variables
 # ------------------------------------------------------------------------------
 ZABBIX_DB_NAME="${ZABBIX_DB_NAME:-zabbix}"
@@ -36,14 +49,13 @@ ZABBIX_DB_USER="${ZABBIX_DB_USER:-zabbix}"
 ZABBIX_DB_PASSWORD="${ZABBIX_DB_PASSWORD:-$(openssl rand -hex 16)}"
 ZABBIX_SERVER_PORT="${ZABBIX_SERVER_PORT:-10051}"
 ZABBIX_LOCAL_WEB_PORT="${ZABBIX_LOCAL_WEB_PORT:-8080}"
-ZABBIX_RELEASE_PKG_URL="https://repo.zabbix.com/zabbix/8.0/release/debian/pool/main/z/zabbix-release/zabbix-release_latest+debian13_all.deb"
 
 export DEBIAN_FRONTEND=noninteractive
 
 # ------------------------------------------------------------------------------
-# 1. OS Verification & Upgrade to Debian 13 (Trixie) if needed
+# 1. OS Verification & Distribution Detection
 # ------------------------------------------------------------------------------
-log_step "1. Checking OS Distribution and Ensuring Debian 13 (Trixie)"
+log_step "1. Checking OS Distribution and Release"
 
 if [[ -f /etc/os-release ]]; then
     # shellcheck source=/dev/null
@@ -53,29 +65,19 @@ else
     exit 1
 fi
 
-if [[ "${ID:-}" != "debian" ]]; then
-    log_warn "Current distribution is '${ID:-unknown}'. Recommended is Debian 13 (Trixie)."
+CURRENT_CODENAME="${VERSION_CODENAME:-bookworm}"
+if [[ "$CURRENT_CODENAME" == "trixie" || "${VERSION_ID:-}" == "13"* ]]; then
+    log_info "Running on Debian 13 (Trixie)."
+    DEB_VER="13"
+else
+    log_info "Running on Debian 12 (Bookworm)."
+    DEB_VER="12"
 fi
 
-CURRENT_CODENAME="${VERSION_CODENAME:-bookworm}"
-if [[ "$CURRENT_CODENAME" == "bookworm" ]]; then
-    log_info "Detected Debian 12 (Bookworm). Upgrading package repositories to Debian 13 (Trixie)..."
-    if [[ -f /etc/apt/sources.list ]]; then
-        sed -i 's/bookworm/trixie/g' /etc/apt/sources.list
-    fi
-    if ls /etc/apt/sources.list.d/*.sources >/dev/null 2>&1; then
-        sed -i 's/bookworm/trixie/g' /etc/apt/sources.list.d/*.sources
-    fi
-    if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
-        sed -i 's/bookworm/trixie/g' /etc/apt/sources.list.d/*.list
-    fi
-    apt-get update -y
-    apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-    log_success "System upgraded to Debian 13 (Trixie)."
-else
-    log_info "Running on Debian '${CURRENT_CODENAME}'."
-    apt-get update -y
-fi
+ZABBIX_RELEASE_PKG_URL="https://repo.zabbix.com/zabbix/8.0/release/debian/pool/main/z/zabbix-release/zabbix-release_latest+debian${DEB_VER}_all.deb"
+
+apt-get update -y
+log_success "Package indices updated."
 
 # ------------------------------------------------------------------------------
 # 2. Base Prerequisites & Locale Setup
@@ -115,9 +117,16 @@ log_success "Base prerequisites and locales configured."
 # ------------------------------------------------------------------------------
 # 3. PostgreSQL Installation & Configuration
 # ------------------------------------------------------------------------------
-log_step "3. Installing and Configuring PostgreSQL Database Server"
-
-apt-get install -y --no-install-recommends postgresql postgresql-contrib
+if [[ "${DEB_VER:-13}" == "12" ]]; then
+    log_info "Configuring PostgreSQL official APT repo for Debian 12..."
+    install -d /etc/apt/keyrings
+    wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg --yes 2>/dev/null || true
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+    apt-get update -y
+    apt-get install -y --no-install-recommends postgresql-17 postgresql-contrib-17
+else
+    apt-get install -y --no-install-recommends postgresql postgresql-contrib
+fi
 
 systemctl enable --now postgresql
 sleep 2

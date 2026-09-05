@@ -199,6 +199,20 @@ freeze_container_network() {
     gw6=$(pct exec "$ctid" -- ip -6 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
     [[ -z "$gw6" ]] && gw6=$(pct exec "$ctid" -- ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
 
+    # Capture active DNS nameservers and search domain from DHCP before converting to static
+    local nameservers searchdomain
+    nameservers=$(pct exec "$ctid" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
+    searchdomain=$(pct exec "$ctid" -- awk '/^search/ {print $2}' /etc/resolv.conf 2>/dev/null | head -n1 || true)
+    if [[ -z "$nameservers" ]]; then
+        nameservers="1.1.1.1 8.8.8.8"
+    fi
+
+    # CRITICAL: Link-local IPv6 gateway (fe80::...) CANNOT be used in Proxmox gw6 without device scope!
+    if [[ "$gw6" =~ ^[fF][eE]80: ]]; then
+        echo -e "${YW}[*] Link-local IPv6 gateway (${gw6}) detected; router advertisements (SLAAC) manage default route.${CL}"
+        gw6=""
+    fi
+
     local net_str="name=eth0,bridge=${bridge},firewall=0"
     if [[ -n "$ip4_cidr" ]]; then
         net_str+=",ip=${ip4_cidr}"
@@ -212,11 +226,47 @@ freeze_container_network() {
     if [[ -n "$ip6_cidr" ]]; then
         net_str+=",ip6=${ip6_cidr}"
         [[ -n "$gw6" ]] && net_str+=",gw6=${gw6}"
-        echo -e "${GN}[+] Acquired IPv6: ${ip6_cidr} (Gateway: ${gw6:-none})${CL}"
+        echo -e "${GN}[+] Acquired IPv6: ${ip6_cidr} (Gateway: ${gw6:-SLAAC RA})${CL}"
     fi
 
     echo -e "${BL}[*] Locking network lease into STATIC IP configuration in Proxmox VE (pct set)...${CL}"
-    pct set "$ctid" -net0 "$net_str" >/dev/null 2>&1 || true
+    local set_cmd=(pct set "$ctid" -net0 "$net_str" -nameserver "$nameservers")
+    [[ -n "$searchdomain" ]] && set_cmd+=(-searchdomain "$searchdomain")
+    "${set_cmd[@]}" >/dev/null 2>&1 || true
+
+    # Safeguard: Ensure live interface eth0 is UP, routes are preserved, and DNS nameservers exist
+    pct exec "$ctid" -- bash -c "
+        ip link set dev eth0 up 2>/dev/null || true
+        if [[ -n '$ip4_cidr' ]]; then
+            ip -4 addr replace '$ip4_cidr' dev eth0 2>/dev/null || true
+            [[ -n '$gw4' ]] && ip -4 route replace default via '$gw4' dev eth0 2>/dev/null || true
+        fi
+        if [[ -n '$ip6_cidr' ]]; then
+            ip -6 addr replace '$ip6_cidr' dev eth0 2>/dev/null || true
+        fi
+        mkdir -p /etc
+        if ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+            for ns in $nameservers; do
+                echo \"nameserver \$ns\" >> /etc/resolv.conf
+            done
+            ${searchdomain:+echo \"search $searchdomain\" >> /etc/resolv.conf}
+        fi
+    " 2>/dev/null || true
+
+    # Write permanent /etc/network/interfaces inside container as backup
+    if [[ -n "$ip4_cidr" ]]; then
+        pct exec "$ctid" -- bash -c "cat > /etc/network/interfaces << 'IFEOF'
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address ${ip4_cidr}
+    ${gw4:+gateway ${gw4}}
+${ip6_cidr:+iface eth0 inet6 static
+    address ${ip6_cidr}}
+IFEOF" 2>/dev/null || true
+    fi
 
     CT_IP_V4="${ip4_cidr%%/*}"
     CT_IP_V6="${ip6_cidr%%/*}"

@@ -496,6 +496,17 @@ if [[ "$FREEZE_NET" == "true" ]]; then
         GW6=$(pct exec "$CTID" -- ip -6 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
         [[ -z "$GW6" ]] && GW6=$(pct exec "$CTID" -- ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
 
+        # Capture active nameservers from container
+        NAMESERVERS=$(pct exec "$CTID" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
+        if [[ -z "$NAMESERVERS" ]]; then
+            NAMESERVERS="1.1.1.1 8.8.8.8"
+        fi
+
+        # CRITICAL: Link-local IPv6 gateway (fe80::...) CANNOT be used in Proxmox gw6 without device scope!
+        if [[ "$GW6" =~ ^[fF][eE]80: ]]; then
+            GW6=""
+        fi
+
         BR_NAME=$(echo "$NET0_CONF" | grep -oP 'bridge=\K[^,]+' || echo "ProxNET")
 
         if [[ -n "$IP4_CIDR" ]]; then
@@ -506,7 +517,21 @@ if [[ "$FREEZE_NET" == "true" ]]; then
                 [[ -n "$GW6" ]] && NEW_NET0+=",gw6=${GW6}"
             fi
             echo "[+] Ustawiono statyczny adres IP w Proxmox VE: IPv4=${IP4_CIDR} (GW: ${GW4:-brak})${IP6_CIDR:+, IPv6=${IP6_CIDR}}"
-            pct set "$CTID" -net0 "$NEW_NET0" >/dev/null 2>&1 || true
+            pct set "$CTID" -net0 "$NEW_NET0" -nameserver "$NAMESERVERS" >/dev/null 2>&1 || true
+
+            # Re-assert routes and resolv.conf inside container
+            pct exec "$CTID" -- bash -c "
+                ip link set dev eth0 up 2>/dev/null || true
+                ip -4 addr replace '$IP4_CIDR' dev eth0 2>/dev/null || true
+                [[ -n '$GW4' ]] && ip -4 route replace default via '$GW4' dev eth0 2>/dev/null || true
+                [[ -n '$IP6_CIDR' ]] && ip -6 addr replace '$IP6_CIDR' dev eth0 2>/dev/null || true
+                mkdir -p /etc
+                if ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+                    for ns in $NAMESERVERS; do
+                        echo \"nameserver \$ns\" >> /etc/resolv.conf
+                    done
+                fi
+            " 2>/dev/null || true
         fi
     fi
 fi
