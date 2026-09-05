@@ -63,6 +63,11 @@ CACHE_DIR="/tmp/wazuh5_agent_cache"
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 mkdir -p "$(dirname "$HASLA_FILE")"
 
+# Zabbix Agent Configuration
+ZABBIX_ENABLED="${ZABBIX_AGENT_ENABLE:-true}"
+ZABBIX_SRV="${ZABBIX_SERVER:-zabbix.slurp.pl}"
+ZABBIX_SRV_ACTIVE="${ZABBIX_SERVER_ACTIVE:-${ZABBIX_SRV}}"
+
 # ------------------------------------------------------------------------------
 # 2. Multi-Distro OS Inspection Inside Container
 # ------------------------------------------------------------------------------
@@ -444,6 +449,59 @@ else
     echo "[CT] Wazuh Agent: brak oficjalnego pakietu dla ${CT_ID} w kanale v5 beta - pomijam instalację agenta (system zabezpieczony pomyślnie)."
 fi
 
+if [ "${ZABBIX_ENABLED}" = "true" ]; then
+    echo "[CT] 6. Konfiguracja Zabbix Agent 2 (Serwer: ${ZABBIX_SRV})..."
+    case "${CT_FAMILY}" in
+        debian)
+            apt-get install -y zabbix-agent2 2>/dev/null || apt-get install -y zabbix-agent 2>/dev/null || true
+            ;;
+        rhel)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y zabbix-agent2 2>/dev/null || dnf install -y zabbix-agent 2>/dev/null || true
+            elif command -v yum >/dev/null 2>&1; then
+                yum install -y zabbix-agent2 2>/dev/null || yum install -y zabbix-agent 2>/dev/null || true
+            fi
+            ;;
+        suse)
+            zypper --non-interactive install -y zabbix-agent2 2>/dev/null || zypper --non-interactive install -y zabbix-agent 2>/dev/null || true
+            ;;
+        arch)
+            pacman -S --noconfirm --needed zabbix-agent2 2>/dev/null || pacman -S --noconfirm --needed zabbix-agent 2>/dev/null || true
+            ;;
+        alpine)
+            apk add --no-cache zabbix-agent2 2>/dev/null || apk add --no-cache zabbix-agent 2>/dev/null || true
+            ;;
+    esac
+
+    ZBX_CFG=""
+    ZBX_SVC=""
+    if [ -f /etc/zabbix/zabbix_agent2.conf ]; then
+        ZBX_CFG="/etc/zabbix/zabbix_agent2.conf"
+        ZBX_SVC="zabbix-agent2"
+    elif [ -f /etc/zabbix/zabbix_agentd.conf ]; then
+        ZBX_CFG="/etc/zabbix/zabbix_agentd.conf"
+        ZBX_SVC="zabbix-agent"
+    fi
+
+    if [ -n "\$ZBX_CFG" ] && [ -f "\$ZBX_CFG" ]; then
+        sed -i "s/^#\? \?Server=.*/Server=${ZABBIX_SRV}/" "\$ZBX_CFG" 2>/dev/null || true
+        sed -i "s/^#\? \?ServerActive=.*/ServerActive=${ZABBIX_SRV_ACTIVE}/" "\$ZBX_CFG" 2>/dev/null || true
+        CT_NAME="\$(hostname 2>/dev/null || echo "ct-${CTID}")"
+        sed -i "s/^#\? \?Hostname=.*/Hostname=\${CT_NAME}/" "\$ZBX_CFG" 2>/dev/null || true
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable --now "\$ZBX_SVC" 2>/dev/null || true
+        elif [ -d /run/openrc ] || [ -f /sbin/openrc-run ]; then
+            rc-update add "\$ZBX_SVC" default 2>/dev/null || true
+            rc-service "\$ZBX_SVC" restart 2>/dev/null || true
+        fi
+        echo "[CT] Zabbix Agent (\$ZBX_SVC) został skonfigurowany i uruchomiony."
+    else
+        echo "[CT] Zabbix Agent: pakiet niedostępny w bieżącym repozytorium (pomijam)."
+    fi
+fi
+
 # Clean caches
 command -v apt-get >/dev/null 2>&1 && apt-get clean 2>/dev/null || true
 command -v dnf >/dev/null 2>&1 && dnf clean all 2>/dev/null || true
@@ -493,6 +551,8 @@ echo "=========================================================="
 echo "[+] Kontener $CTID (${CT_PRETTY_NAME}) został pomyślnie skonfigurowany!"
 echo "    Użytkownik: ${LXC_USER} (logowanie przez klucze SSH)"
 echo "    Rodzina: ${CT_FAMILY} | Format: ${PKG_FORMAT}"
+echo "    Wazuh Agent: wersja 5 (${WAZUH_VER})"
+echo "    Zabbix Agent: serwer ${ZABBIX_SRV}"
 echo "    NTP: czas pilnowany bezpośrednio z jądra hosta PVE"
 echo "=========================================================="
 

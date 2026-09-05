@@ -50,18 +50,25 @@ proxmox-scripts/
 ├── backup/
 │   ├── pbs-host-backup.sh        # Standalone bare-metal host backup to Proxmox Backup Server
 │   ├── pbs-host-backup-hook.sh   # Dynamic vzdump hook script (runs host backup on job-start)
+│   ├── pve-cluster-config-backup.sh # Encrypted lightweight /etc/pve metadata & host configuration backup
 │   └── vzdump-wrapper.sh         # vzdump hook wrapper calling the cluster hook script
 ├── provisioning/
 │   ├── autoinstall.sh            # Batch LXC provisioner & hardening engine
+│   ├── create_golden_template.sh # Generator for pre-hardened, pre-installed "Golden Image" LXC templates
 │   ├── lxc-auto-provision-watcher.sh # Background watcher daemon for newly started containers
 │   ├── lxc-provision-hook.sh     # Proxmox container hookscript (alternative to daemon)
-│   ├── nowykontener.sh           # Single LXC provisioner & hardening script (Wazuh v5, host-managed clock)
+│   ├── nowykontener.sh           # Universal multi-distro provisioner (Wazuh v5, Zabbix Agent 2, no NTP)
 │   ├── setup_lxc.sh -> nowykontener.sh # Convenience symlink
+│   ├── update_provisioning.sh    # Post-provisioning upgrade suite (legacy to v5 Wazuh, Zabbix Agent 2, SSH)
 │   └── update_wazuh_agent_v5.sh  # Automated Wazuh Agent v5 upgrade suite (Host, LXC, VM)
 ├── scripts/
 │   ├── autoinstall.sh            # Host wrapper forwarding to /etc/pve/scripts/autoinstall.sh
+│   ├── create_golden_template.sh # Host wrapper forwarding to create_golden_template.sh
 │   ├── lxc-auto-provision-watcher.sh # Host wrapper forwarding to lxc-auto-provision-watcher.sh
 │   ├── nowykontener.sh           # Host wrapper forwarding to nowykontener.sh
+│   ├── pve-cluster-config-backup.sh # Host wrapper forwarding to pve-cluster-config-backup.sh
+│   ├── pve-host-hardening.sh     # Host wrapper forwarding to pve-host-hardening.sh
+│   ├── update_provisioning.sh    # Host wrapper forwarding to update_provisioning.sh
 │   └── update_wazuh_agent_v5.sh  # Host wrapper forwarding to update_wazuh_agent_v5.sh
 ├── vms/
 │   ├── create_trex_vm.sh         # Deploy Cisco TRex generator VM with Cloud-Init & DPDK tuning
@@ -81,6 +88,7 @@ proxmox-scripts/
 ├── distributed/
 │   └── wazuh5-distributed.sh     # Multi-node Wazuh 5 cluster installer
 ├── system-config/
+│   ├── pve-host-hardening.sh     # Hypervisor host kernel sysctl, hardware watchdog & ZFS ARC tuning
 │   ├── setup_sdn_cluster_net.sh  # Automated Proxmox SDN VNet (Wazuh-cluster-net, VLAN > 1500, 10.69.101.0/24)
 │   ├── lxc-auto-provision.service# Systemd service unit for automated LXC provisioning watcher
 │   ├── nginx-zabbix-reverse-proxy.conf # Production Nginx reverse proxy configuration for Zabbix
@@ -134,6 +142,11 @@ nano .env
   - Executes during the `job-start` phase, backing up the hypervisor host right as the container/VM backup job begins.
   - Dynamically reads the node hostname (`$(hostname)`).
 
+- **`backup/pve-cluster-config-backup.sh`**:
+  - **Lightweight Encrypted Metadata Backup**: Backs up `/etc/pve` (all CT & VM configs, `corosync.conf`, `storage.cfg`, SDN, users, certificates) along with host `/etc/network/interfaces*`, `/etc/hosts`, sysctl, and crontabs.
+  - **Client-Side Symmetrical Encryption**: Encrypts the archive using OpenSSL AES-256-CBC (PBKDF2) with passphrase from `PVE_CONFIG_BACKUP_KEY` or `PBS_PASSWORD`.
+  - **Automated Rotation**: Keeps the last N daily backup archives (configurable via `PVE_CONFIG_BACKUP_KEEP`) in `/var/backups/pve-cluster/`. Supports `--restore <archive.enc>` for instant disaster recovery.
+
 ### 2. LXC Provisioning & Wazuh Agent v5 Upgrade Suite (`provisioning/`)
 
 - **`provisioning/update_wazuh_agent_v5.sh`** (Host, LXC, KVM VMs):
@@ -161,8 +174,22 @@ nano .env
   - **User & Sudo Configuration**: Dynamically creates administrative user (e.g., `hubi`) with correct distro sudo groups (`sudo` vs `wheel`), prefers `fish` shell with fallback to `bash`/`sh`. Supports non-interactive automated password generation when run in background.
   - **System Hardening**: Installs firewall (`ufw` or `firewalld`), intrusion prevention (`fail2ban`), unattended updates, and integrity tools according to distro ecosystem.
   - **Wazuh Agent v5 Integration**: Automatically selects and caches either `.deb` or `.rpm` packages on the Proxmox host, pushes to the container, and installs via native package manager (`dpkg`, `rpm`, `dnf`, `zypper`).
+  - **Zabbix Agent 2 Integration**: Automatically installs and configures high-performance **Zabbix Agent 2** (or fallback `zabbix-agent`), configuring passive/active server endpoints (`ZABBIX_SERVER`), hostnames, and service auto-start.
   - **Host-Managed Clock (No Guest NTP)**: Disables and masks redundant NTP services (`chrony`, `systemd-timesyncd`, `ntpd`, OpenRC `chronyd`) inside containers. Linux containers directly share the hypervisor kernel clock, avoiding capability errors and redundant external NTP lookups.
   - **State Tracking**: Statically marks configured containers with `/etc/.lxc_provisioned` and records credentials in `$HASLA_FILE` (`/etc/pve/secrets/.hasla`).
+
+- **`provisioning/update_provisioning.sh`**:
+  - **Legacy-to-Current Migration Suite**: Upgrades existing containers, VMs, and hosts from older versions to the latest standard.
+  - **Comprehensive Refresh**:
+    - Upgrades older Wazuh Agents (v3/v4) to **Wazuh Agent v5** (with automated 4.14.7-1 bridge handling for <4.14).
+    - Upgrades older Zabbix Agent 1 to **Zabbix Agent 2**, re-pointing configuration to current `$ZABBIX_SERVER`.
+    - Refreshes SSH configuration with Post-Quantum key exchange (`sntrup761x25519`).
+    - Purges and masks lingering NTP / Chrony daemons inside containers.
+  - **Audit & Status Mode (`--status`)**: Produces a clean tabular overview of current Wazuh, Zabbix, and provisioning state across all cluster nodes.
+
+- **`provisioning/create_golden_template.sh`**:
+  - **Automated Golden Image Generator**: Spins up an ephemeral base container, applies full hardening and installs Wazuh v5 + Zabbix Agent 2, sanitizes machine IDs and SSH host keys, and exports directly to a `.tar.zst` template in PVE template storage.
+  - **Sub-2-Second Deployment**: New containers created from the golden template are 100% pre-hardened and pre-configured at boot, without any network package downloads.
 
 - **`provisioning/lxc-auto-provision-watcher.sh`** & **`system-config/lxc-auto-provision.service`**:
   - **Automated Container Onboarding Daemon**: Continuously watches for newly created and started LXC containers across all Linux distributions.
@@ -220,6 +247,18 @@ nano .env
 - **`install/install_snmp_collector.sh`**: SNMP daemon & syslog poller setup.
 - **`install/install_nuclei.sh`**: Nuclei scanner & templates setup.
 - **`install/wazuh-install.sh`**: Wazuh 5 container install assistant.
+
+### 7. Hypervisor Hardening, Stability & System Tuning (`system-config/`)
+
+- **`system-config/pve-host-hardening.sh`**:
+  - **Kernel Sysctl Hardening**: Applies `/etc/sysctl.d/99-pve-hardening.conf` (SYN cookie protection, strict reverse-path filtering, ICMP redirect rejection, `kernel.yama.ptrace_scope = 2`, and `vm.swappiness = 10`).
+  - **Hardware Watchdog Integration**: Probes and loads hardware watchdog modules (`iTCO_wdt`, `sp5100_tco`, `ipmi_watchdog` or `softdog`) and wires them into `/etc/default/pve-ha-crm` to ensure automatic node recovery upon kernel deadlocks.
+  - **ZFS ARC RAM Capping**: Limits ZFS ARC cache memory allocation to prevent host Out-Of-Memory freezes during dynamic VM/LXC allocation.
+  - **Repository & Subscription Cleanup**: Automatically activates `pve-no-subscription`, comments out inactive enterprise repositories, and removes the "No Valid Subscription" web UI prompt.
+  - **Automated Disk Health**: Ensures SMART disk monitoring (`smartd`) is enabled and scheduled.
+
+- **`system-config/dpdk-bind.sh`**, **`cpu-affinity.conf`**, **`hugepages.conf`**:
+  - Line-rate DPDK driver binding (`vfio-pci`) and CPU core isolation for networking performance.
 
 
 ---
@@ -296,14 +335,48 @@ journalctl -u lxc-auto-provision.service -f
 tail -f /var/log/lxc-auto-provision.log
 ```
 
-### Audit Wazuh Agent Versions Across Host, LXCs, and VMs:
+### Audit Wazuh & Zabbix Agent Versions Across Cluster:
 ```bash
-bash provisioning/update_wazuh_agent_v5.sh --status
+bash provisioning/update_provisioning.sh --status
 ```
 
-### Upgrade Wazuh Agent to v5 Across Everything (Host, All LXCs, All VMs):
+### Upgrade Existing Containers / Hosts to Current Provisioning Standard:
 ```bash
-bash provisioning/update_wazuh_agent_v5.sh --all
+# Upgrade all running containers (Wazuh v5, Zabbix Agent 2, SSH hardening, NTP cleanup):
+bash provisioning/update_provisioning.sh --ct
+
+# Upgrade specific containers:
+bash provisioning/update_provisioning.sh --ct 101 102
+
+# Upgrade everything (Host + all containers):
+bash provisioning/update_provisioning.sh --all
+```
+
+### Apply Hypervisor Host Hardening & Stability Optimization:
+```bash
+# Applies sysctl network/memory hardening, enables hardware watchdog, limits ZFS ARC:
+bash system-config/pve-host-hardening.sh
+```
+
+### Run Encrypted PVE Cluster Metadata & Config Backup:
+```bash
+# Backs up /etc/pve (VM/CT configs, corosync, storage.cfg) encrypted with AES-256:
+bash backup/pve-cluster-config-backup.sh
+
+# List existing encrypted backups:
+bash backup/pve-cluster-config-backup.sh --list
+
+# Decrypt and inspect an archive:
+bash backup/pve-cluster-config-backup.sh --restore /var/backups/pve-cluster/pve_cluster_config_*.tar.gz.enc
+```
+
+### Generate Pre-Hardened "Golden Image" LXC Template (Sub-2s Boot):
+```bash
+# Creates a ready-to-deploy debian-hardened-golden.tar.zst in PVE template storage:
+bash provisioning/create_golden_template.sh
+
+# Deploy a new container instantly from the golden template:
+pct create 150 local:vztmpl/debian-hardened-golden.tar.zst --hostname my-new-app --net0 name=eth0,bridge=ProxNET,ip=dhcp
 ```
 
 ### Deploy Zabbix 8.0 LTS LXC Container (Debian 13 Trixie + PostgreSQL 17):
