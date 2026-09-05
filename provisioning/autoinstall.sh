@@ -87,7 +87,13 @@ for CTID in "${CTIDS[@]}"; do
     fi
 
     # Check if already processed
-    if [[ -f "$HASLA_FILE" ]] && grep -q "CTID: $CTID |" "$HASLA_FILE"; then
+    if pct exec "$CTID" -- test -f /etc/.lxc_provisioned 2>/dev/null; then
+        echo "[!] Kontener $CTID posiada już znacznik konfiguracji (/etc/.lxc_provisioned). Pomijanie..."
+        echo ""
+        continue
+    fi
+
+    if [[ -f "$HASLA_FILE" ]] && grep -q "CTID: $CTID " "$HASLA_FILE"; then
         echo "[!] Kontener $CTID figuruje już w bazie haseł ($HASLA_FILE). Pomijanie..."
         echo ""
         continue

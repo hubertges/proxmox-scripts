@@ -1,0 +1,17 @@
+[Unit]
+Description=Proxmox LXC Automated Provisioning Watcher Daemon
+Documentation=https://github.com/hubertges/proxmox-scripts
+After=pve-cluster.service pve-guests.service network.target
+Wants=pve-guests.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/etc/pve/scripts/lxc-auto-provision-watcher.sh --daemon
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

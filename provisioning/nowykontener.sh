@@ -47,10 +47,12 @@ HASLA_FILE="${HASLA_FILE:-/etc/pve/secrets/.hasla}"
 LXC_USER="${LXC_DEFAULT_USER:-hubi}"
 SEARCH_DOMAIN="${SEARCH_DOMAIN:-slurp.intra}"
 SSH_PUBKEY="${SSH_PUBKEY_PATH:-/root/.ssh/authorized_keys}"
-CHRONY_CONF="${CHRONY_CONF_PATH:-/etc/chrony/chrony.conf}"
 WAZUH_MGR="${WAZUH_MANAGER:-wazuh.slurp.pl}"
 WAZUH_GRP="${WAZUH_AGENT_GROUP:-linux-servers}"
-WAZUH_VER="${WAZUH_AGENT_VERSION:-4.14.7-1}"
+WAZUH_VER="${WAZUH_AGENT_V5_VERSION:-5.0.0-beta5}"
+BASE_V5_URL="https://packages-staging.xdrsiem.wazuh.info/pre-release/5.x"
+CACHE_DIR="/tmp/wazuh5_agent_cache"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
 mkdir -p "$(dirname "$HASLA_FILE")"
 
@@ -61,16 +63,16 @@ echo "=========================================================="
 echo "[+] Weryfikacja kontenera: $CTID"
 echo "=========================================================="
 
-STATUS=$(pct status "$CTID" 2>/dev/null | awk "{print \$2}")
+STATUS=$(pct status "$CTID" 2>/dev/null | awk '{print $2}' || echo "stopped")
 if [[ "$STATUS" != "running" ]]; then
-    echo "[-] Błąd: Kontener $CTID nie jest uruchomiony (status: ${STATUS:-nieznany})." >&2
+    echo "[-] Błąd: Kontener $CTID nie jest uruchomiony (status: ${STATUS})." >&2
     exit 1
 fi
 
-CT_ID=$(pct exec "$CTID" -- bash -c ' . /etc/os-release 2>/dev/null && echo "${ID:-unknown}" ')
-CT_CODENAME=$(pct exec "$CTID" -- bash -c ' . /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-unknown}" ')
+CT_ID=$(pct exec "$CTID" -- bash -c '. /etc/os-release 2>/dev/null && echo "${ID:-unknown}"' || echo "unknown")
+CT_CODENAME=$(pct exec "$CTID" -- bash -c '. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-unknown}"' || echo "unknown")
 if [[ "$CT_CODENAME" == "unknown" ]]; then
-    CT_CODENAME=$(pct exec "$CTID" -- bash -c ' lsb_release -cs 2>/dev/null || echo "unknown" ')
+    CT_CODENAME=$(pct exec "$CTID" -- bash -c 'lsb_release -cs 2>/dev/null || echo "unknown"' || echo "unknown")
 fi
 
 OS_SUPPORTED=0
@@ -97,33 +99,63 @@ fi
 echo "[+] Wykryto obsługiwany system: $CT_ID ($CT_CODENAME)"
 
 # ------------------------------------------------------------------------------
-# 3. User Password Configuration
+# 3. User Password Configuration (Interactive or Automated)
 # ------------------------------------------------------------------------------
 TARGET_USER_PASS="${LXC_USER_PASSWORD:-}"
 if [[ -z "$TARGET_USER_PASS" ]]; then
-    echo -n "[?] Podaj hasło dla użytkownika '$LXC_USER' (dla kontenera $CTID): "
-    read -s TARGET_USER_PASS
-    echo ""
+    if [[ -t 0 ]]; then
+        echo -n "[?] Podaj hasło dla użytkownika '$LXC_USER' (dla kontenera $CTID): "
+        read -s TARGET_USER_PASS
+        echo ""
+    else
+        # Non-interactive mode (e.g. from watcher daemon)
+        TARGET_USER_PASS=$(openssl rand -base64 12)
+        echo "[+] Tryb nieinteraktywny: wygenerowano losowe hasło dla użytkownika '$LXC_USER'."
+    fi
 fi
 
 if [[ -z "$TARGET_USER_PASS" ]]; then
-    echo "[-] Błąd: Hasło użytkownika nie może być puste." >&2
-    exit 1
+    TARGET_USER_PASS=$(openssl rand -base64 12)
 fi
 
 # ------------------------------------------------------------------------------
 # 4. Root Password Generation & Storage
 # ------------------------------------------------------------------------------
 ROOT_PASS=$(openssl rand -base64 16)
-echo "CTID: $CTID | User: $LXC_USER | Root Pass: $ROOT_PASS | Data: $(date)" >> "$HASLA_FILE"
+echo "CTID: $CTID | User: $LXC_USER (Pass: $TARGET_USER_PASS) | Root Pass: $ROOT_PASS | Data: $(date)" >> "$HASLA_FILE"
 chmod 600 "$HASLA_FILE" 2>/dev/null || true
-echo "[+] Wygenerowano losowe hasło roota. Zapisano w $HASLA_FILE na hoście Proxmox."
+echo "[+] Wygenerowano hasła dla kontenera $CTID. Zapisano w $HASLA_FILE."
 
 echo "root:$ROOT_PASS" | pct exec "$CTID" -- chpasswd
 echo "[+] Hasło roota w kontenerze zostało zaktualizowane."
 
 # ------------------------------------------------------------------------------
-# 5. Build Container Payload Script
+# 5. Prepare Wazuh Agent v5 Package on Host
+# ------------------------------------------------------------------------------
+CT_ARCH=$(pct exec "$CTID" -- uname -m 2>/dev/null || echo "x86_64")
+WAZUH_DEB_NAME="wazuh-agent_${WAZUH_VER}_amd64.deb"
+WAZUH_URL="${BASE_V5_URL}/apt/pool/main/w/wazuh-agent/${WAZUH_DEB_NAME}"
+
+if [[ "$CT_ARCH" == "aarch64" || "$CT_ARCH" == "arm64" ]]; then
+    WAZUH_DEB_NAME="wazuh-agent_${WAZUH_VER}_arm64.deb"
+    WAZUH_URL="${BASE_V5_URL}/apt/pool/main/w/wazuh-agent/${WAZUH_DEB_NAME}"
+fi
+
+HOST_PKG_CACHE="${CACHE_DIR}/${WAZUH_DEB_NAME}"
+if [[ ! -f "$HOST_PKG_CACHE" ]]; then
+    echo "[+] Pobieranie pakietu Wazuh Agent v5 (${WAZUH_DEB_NAME}) do pamięci podręcznej..."
+    curl -fsSL "$WAZUH_URL" -o "$HOST_PKG_CACHE" || {
+        echo "[-] Błąd pobierania pakietu Wazuh v5 z $WAZUH_URL" >&2
+    }
+fi
+
+if [[ -f "$HOST_PKG_CACHE" ]]; then
+    echo "[+] Przesyłanie pakietu Wazuh Agent v5 do kontenera $CTID..."
+    pct push "$CTID" "$HOST_PKG_CACHE" "/tmp/wazuh-agent-v5.deb"
+fi
+
+# ------------------------------------------------------------------------------
+# 6. Build Container Payload Script
 # ------------------------------------------------------------------------------
 PAYLOAD="/tmp/lxc_setup_payload_${CTID}.sh"
 
@@ -152,10 +184,16 @@ fi
 echo "[CT] 1. Instalacja podstawowych narzędzi administracyjnych..."
 apt-get update -y
 apt-get install -y ca-certificates curl wget gnupg lsb-release apt-transport-https debian-archive-keyring \
-                   pv fish fortunes-pl cowsay chrony sudo \
+                   pv fish fortunes-pl cowsay sudo \
                    unattended-upgrades apt-listchanges ufw fail2ban libpam-tmpdir needrestart debsums rkhunter
 
 apt-get install -y fastfetch || echo "[CT] Pakiet fastfetch niedostępny w bieżącym repozytorium (pomijam)."
+
+# Czas jest synchronizowany bezpośrednio z jądra hiperwizora Proxmox VE
+echo "[CT] Wyłączanie zbędnych usług synchronizacji czasu NTP (czas synchronizowany z hosta)..."
+systemctl disable --now chrony 2>/dev/null || true
+systemctl disable --now systemd-timesyncd 2>/dev/null || true
+systemctl mask systemd-timesyncd 2>/dev/null || true
 
 echo "[CT] 2. Modernizacja źródeł APT..."
 if [[ "\$OS_ID" == "debian" ]]; then
@@ -251,42 +289,49 @@ if [[ -f /etc/ssh/sshd_config ]]; then
     fi
 fi
 
-echo "[CT] 6. Konfiguracja Chrony dla LXC (-x flag)..."
-if grep -q "^DAEMON_OPTS=" /etc/default/chrony 2>/dev/null; then
-    sed -i 's/^DAEMON_OPTS=.*/DAEMON_OPTS="-x"/' /etc/default/chrony
+echo "[CT] 6. Instalacja Wazuh-Agent v5 (${WAZUH_VER}) podłączanego do ${WAZUH_MGR}..."
+if [[ -f /tmp/wazuh-agent-v5.deb ]]; then
+    export WAZUH_MANAGER="${WAZUH_MGR}"
+    export WAZUH_AGENT_GROUP="${WAZUH_GRP}"
+    
+    if dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb > /tmp/wazuh_install.log 2>&1 || (apt-get install -f -y >> /tmp/wazuh_install.log 2>&1 && dpkg --force-confdef --force-confold -i /tmp/wazuh-agent-v5.deb >> /tmp/wazuh_install.log 2>&1); then
+        systemctl daemon-reload
+        systemctl enable wazuh-agent >/dev/null 2>&1 || true
+        systemctl restart wazuh-agent >/dev/null 2>&1 || true
+        rm -f /tmp/wazuh-agent-v5.deb
+    else
+        log_err "Instalacja pakietu Wazuh Agent v5 (dpkg)" "/tmp/wazuh_install.log"
+    fi
 else
-    echo 'DAEMON_OPTS="-x"' >> /etc/default/chrony
+    # Fallback to direct curl download if host push was omitted
+    cd /tmp
+    curl -fsSL "${WAZUH_URL}" -o "./wazuh-agent-v5.deb" 2>/dev/null || true
+    if [[ -f "./wazuh-agent-v5.deb" ]]; then
+        WAZUH_MANAGER="${WAZUH_MGR}" WAZUH_AGENT_GROUP="${WAZUH_GRP}" dpkg --force-confdef --force-confold -i ./wazuh-agent-v5.deb > /tmp/wazuh_install.log 2>&1 || log_err "Instalacja pakietu Wazuh v5 (dpkg)" "/tmp/wazuh_install.log"
+        systemctl daemon-reload
+        systemctl enable wazuh-agent >/dev/null 2>&1 || true
+        systemctl restart wazuh-agent >/dev/null 2>&1 || true
+        rm -f ./wazuh-agent-v5.deb
+    else
+        log_err "Brak pakietu wazuh-agent-v5.deb w kontenerze" ""
+    fi
 fi
 
-echo "[CT] 7. Instalacja Wazuh-Agent (${WAZUH_VER}) podłączanego do ${WAZUH_MGR}..."
-cd /tmp
-WAZUH_DEB="wazuh-agent_${WAZUH_VER}_amd64.deb"
-curl -sL "https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/\${WAZUH_DEB}" -o "./\${WAZUH_DEB}"
-
-if [[ -f "./\${WAZUH_DEB}" ]]; then
-    WAZUH_MANAGER="${WAZUH_MGR}" WAZUH_AGENT_GROUP="${WAZUH_GRP}" dpkg -i "./\${WAZUH_DEB}" > /tmp/wazuh_install.log 2>&1 || log_err "Instalacja pakietu Wazuh (dpkg)" "/tmp/wazuh_install.log"
-    systemctl daemon-reload
-    systemctl enable wazuh-agent || log_err "Włączanie usługi wazuh-agent" ""
-    systemctl start wazuh-agent || log_err "Startowanie usługi wazuh-agent" ""
-else
-    log_err "Pobieranie paczki wazuh-agent (brak pliku)" ""
-fi
-rm -f "./\${WAZUH_DEB}"
 apt-get clean
 INNER_EOF
 
 # ------------------------------------------------------------------------------
-# 6. Execute Payload Inside Container
+# 7. Execute Payload Inside Container
 # ------------------------------------------------------------------------------
 echo "[+] Przesyłanie skryptu konfiguracyjnego do kontenera..."
 pct push "$CTID" "$PAYLOAD" "/tmp/setup.sh"
 pct exec "$CTID" -- chmod +x "/tmp/setup.sh"
 
-echo "[+] Uruchamianie konfiguracji wewnątrz kontenera (APT, pakiety, SSH, Wazuh)..."
-pct exec "$CTID" -- bash -c "/tmp/setup.sh && echo "${LXC_USER}:${TARGET_USER_PASS}" | chpasswd"
+echo "[+] Uruchamianie konfiguracji wewnątrz kontenera (APT, pakiety, SSH, Wazuh v5)..."
+pct exec "$CTID" -- bash -c "/tmp/setup.sh && echo \"${LXC_USER}:${TARGET_USER_PASS}\" | chpasswd"
 
 # ------------------------------------------------------------------------------
-# 7. Host Integration: SSH Keys, Chrony & Network Domain
+# 8. Host Integration: SSH Keys & Network Domain
 # ------------------------------------------------------------------------------
 echo "[+] Kopiowanie autoryzowanych kluczy SSH z hosta do użytkownika ${LXC_USER}..."
 if [[ -f "$SSH_PUBKEY" ]]; then
@@ -298,12 +343,6 @@ else
     echo "[-] Ostrzeżenie: Plik kluczy $SSH_PUBKEY nie istnieje na hoście Proxmox!"
 fi
 
-if [[ -f "$CHRONY_CONF" ]]; then
-    echo "[+] Kopiowanie konfiguracji chrony.conf z hosta..."
-    pct push "$CTID" "$CHRONY_CONF" "/etc/chrony/chrony.conf"
-    pct exec "$CTID" -- systemctl restart chrony || true
-fi
-
 if [[ -n "$SEARCH_DOMAIN" ]]; then
     echo "[+] Ustawianie domeny wyszukiwania DNS na: ${SEARCH_DOMAIN}..."
     pct set "$CTID" -searchdomain "$SEARCH_DOMAIN"
@@ -313,11 +352,14 @@ fi
 echo "[+] Restartowanie usług sieciowych i czyszczenie..."
 pct exec "$CTID" -- systemctl restart ssh 2>/dev/null || pct exec "$CTID" -- systemctl restart sshd 2>/dev/null || true
 pct exec "$CTID" -- rm -f "/tmp/setup.sh"
+pct exec "$CTID" -- bash -c "date -u +'%Y-%m-%dT%H:%M:%SZ' > /etc/.lxc_provisioned && chmod 644 /etc/.lxc_provisioned" 2>/dev/null || true
 rm -f "$PAYLOAD"
 
 echo "=========================================================="
 echo "[+] Kontener $CTID został pomyślnie skonfigurowany!"
 echo "    Użytkownik: ${LXC_USER} (logowanie przez klucze SSH)"
+echo "    Wazuh Agent: wersja 5 (${WAZUH_VER})"
+echo "    NTP: czas pilnowany z poziomu hosta"
 echo "=========================================================="
 
 if pct exec "$CTID" -- [ -s "/tmp/ct_setup_errors.log" ]; then

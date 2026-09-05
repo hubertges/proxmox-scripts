@@ -53,11 +53,15 @@ proxmox-scripts/
 │   └── vzdump-wrapper.sh         # vzdump hook wrapper calling the cluster hook script
 ├── provisioning/
 │   ├── autoinstall.sh            # Batch LXC provisioner & hardening engine
-│   ├── nowykontener.sh           # Single LXC provisioner & hardening script
+│   ├── lxc-auto-provision-watcher.sh # Background watcher daemon for newly started containers
+│   ├── lxc-provision-hook.sh     # Proxmox container hookscript (alternative to daemon)
+│   ├── nowykontener.sh           # Single LXC provisioner & hardening script (Wazuh v5, host-managed clock)
 │   ├── setup_lxc.sh -> nowykontener.sh # Convenience symlink
 │   └── update_wazuh_agent_v5.sh  # Automated Wazuh Agent v5 upgrade suite (Host, LXC, VM)
 ├── scripts/
 │   ├── autoinstall.sh            # Host wrapper forwarding to /etc/pve/scripts/autoinstall.sh
+│   ├── lxc-auto-provision-watcher.sh # Host wrapper forwarding to lxc-auto-provision-watcher.sh
+│   ├── nowykontener.sh           # Host wrapper forwarding to nowykontener.sh
 │   └── update_wazuh_agent_v5.sh  # Host wrapper forwarding to update_wazuh_agent_v5.sh
 ├── vms/
 │   ├── create_trex_vm.sh         # Deploy Cisco TRex generator VM with Cloud-Init & DPDK tuning
@@ -74,6 +78,7 @@ proxmox-scripts/
 ├── distributed/
 │   └── wazuh5-distributed.sh     # Multi-node Wazuh 5 cluster installer
 ├── system-config/
+│   ├── lxc-auto-provision.service# Systemd service unit for automated LXC provisioning watcher
 │   ├── dpdk-bind.sh              # Automated DPDK driver binding utility (vfio-pci)
 │   ├── cpu-affinity.conf         # CPU pinning and core isolation settings
 │   ├── grub-tuning.conf          # Kernel boot parameters (isolcpus, default_hugepagesz)
@@ -142,11 +147,20 @@ nano .env
 - **`provisioning/nowykontener.sh`** (Single container) & **`provisioning/autoinstall.sh`** (Batch mode):
   - **OS Compatibility**: Ubuntu, Debian 12 (Bookworm), Debian 13 (Trixie), TurnKey Linux.
   - **SSH Hardening**: Disables root login (`PermitRootLogin no`), disables password login (`PasswordAuthentication no`), enables post-quantum key exchange (`sntrup761x25519-sha512@openssh.com`) and ED25519.
-  - **User Configuration**: Creates non-root administrative user (e.g., `hubi`), sets up Fish shell with `fastfetch` and `cowsay`/`fortune`.
+  - **User Configuration**: Creates non-root administrative user (e.g., `hubi`), sets up Fish shell with `fastfetch` and `cowsay`/`fortune`. Supports non-interactive automated password generation when run in background.
   - **System Hardening**: Installs `ufw`, `fail2ban`, `unattended-upgrades`, `needrestart`, `debsums`, `rkhunter`.
-  - **Wazuh Agent Integration**: Automatically downloads and installs `wazuh-agent`, connects to `WAZUH_MANAGER`, and assigns to `WAZUH_AGENT_GROUP`.
-  - **Chrony & Clock**: Synchronizes chrony configuration and enables `-x` slew mode for LXC compatibility.
-  - **Password Vault**: Automatically generates strong random root passwords and records them in `$HASLA_FILE` (`/etc/pve/secrets/.hasla`).
+  - **Wazuh Agent v5 Integration**: Automatically downloads and installs the latest **Wazuh Agent v5** (`5.0.0-beta5`), cached on the host and pushed into the container, registered to `WAZUH_MANAGER` and group `WAZUH_AGENT_GROUP`.
+  - **Host-Managed Clock (No Guest NTP)**: Disables and masks `chrony` and `systemd-timesyncd` inside unprivileged containers. Linux containers directly share the hypervisor kernel clock, avoiding capability errors and redundant external NTP lookups.
+  - **State Tracking**: Statically marks configured containers with `/etc/.lxc_provisioned` and records credentials in `$HASLA_FILE` (`/etc/pve/secrets/.hasla`).
+
+- **`provisioning/lxc-auto-provision-watcher.sh`** & **`system-config/lxc-auto-provision.service`**:
+  - **Automated Container Onboarding Daemon**: Continuously watches for newly created and started LXC containers on the Proxmox VE node.
+  - **Zero-Touch Provisioning**: As soon as a new container boots and reaches operational readiness (systemd active, apt locks released), the daemon automatically runs `nowykontener.sh` in the background.
+  - **Failure Backoff**: Implements smart retry cooldowns to avoid spinning on unsupported operating systems.
+  - **Systemd Integration**: Provided as a system service for unattended background operation across node reboots.
+
+- **`provisioning/lxc-provision-hook.sh`**:
+  - Proxmox container hookscript (`pct set <CTID> -hookscript ...`) responding to the `post-start` lifecycle event as an alternative to the systemd daemon.
 
 ### 3. Virtual Machines (`vms/`)
 
@@ -207,6 +221,30 @@ bash provisioning/autoinstall.sh
 ### Batch Provision Specific Containers:
 ```bash
 bash provisioning/autoinstall.sh 101 102 103
+```
+
+### Run LXC Auto-Provision Watcher (One-shot check):
+```bash
+bash provisioning/lxc-auto-provision-watcher.sh --run-once
+```
+
+### Run LXC Auto-Provision Watcher as Background Daemon:
+```bash
+bash provisioning/lxc-auto-provision-watcher.sh --daemon
+```
+
+### Install and Enable LXC Auto-Provision Systemd Service:
+```bash
+# Copy systemd service and reload
+cp system-config/lxc-auto-provision.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now lxc-auto-provision.service
+
+# Check watcher status and logs
+systemctl status lxc-auto-provision.service
+journalctl -u lxc-auto-provision.service -f
+# or check dedicated log
+tail -f /var/log/lxc-auto-provision.log
 ```
 
 ### Audit Wazuh Agent Versions Across Host, LXCs, and VMs:
