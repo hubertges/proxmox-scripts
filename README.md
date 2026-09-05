@@ -2,76 +2,40 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Proxmox VE](https://img.shields.io/badge/Proxmox%20VE-8.x%20%7C%209.x-E57000?logo=proxmox&logoColor=white)](https://www.proxmox.com)
+[![Proxmox Backup Server](https://img.shields.io/badge/PBS-Compatible-orange?logo=proxmox&logoColor=white)](https://www.proxmox.com/en/proxmox-backup-server)
 [![Debian](https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?logo=debian&logoColor=white)](https://www.debian.org)
 [![Bash](https://img.shields.io/badge/Language-Bash%20%2F%20Shell-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
 
-A production-ready toolkit of automated deployment scripts, LXC container builders, high-performance VM provisioning helpers, and hypervisor tuning configs for **Proxmox Virtual Environment (PVE 8.x / 9.x)**.
+A modular toolkit of automated deployment scripts, LXC security hardening & onboarding, host bare-metal backups to Proxmox Backup Server (PBS), and hypervisor tuning for **Proxmox Virtual Environment (PVE 8.x / 9.x)** and clusters.
 
 ---
 
 ## 📋 Table of Contents
 
 - [Overview](#overview)
-- [Architecture & Lab Topology](#architecture--lab-topology)
 - [Repository Structure](#repository-structure)
 - [Security & Environment Variables (.env)](#security--environment-variables-env)
-- [Included Scripts & Components](#included-scripts--components)
-  - [1. Virtual Machines (vms/)](#1-virtual-machines-vms)
-  - [2. LXC Containers (ct/)](#2-lxc-containers-ct)
-  - [3. Guest Appliance Installers (install/)](#3-guest-appliance-installers-install)
-  - [4. Multi-Node Distributed Deployments (distributed/)](#4-multi-node-distributed-deployments-distributed)
-  - [5. System Tuning & DPDK Utilities (system-config/)](#5-system-tuning--dpdk-utilities-system-config)
-- [Getting Started](#getting-started)
-- [Hypervisor Tuning Guide](#hypervisor-tuning-guide)
-- [Contributing & License](#contributing--license)
+- [Included Scripts & Modules](#included-scripts--modules)
+  - [1. Host Bare-Metal Backups to PBS (`backup/`)](#1-host-bare-metal-backups-to-pbs-backup)
+  - [2. LXC Provisioning & Security Hardening (`provisioning/`)](#2-lxc-provisioning--security-hardening-provisioning)
+  - [3. Virtual Machines (`vms/`)](#3-virtual-machines-vms)
+  - [4. Dedicated LXC Containers (`ct/`)](#4-dedicated-lxc-containers-ct)
+  - [5. Guest Appliance Installers (`install/`)](#5-guest-appliance-installers-install)
+  - [6. Multi-Node Distributed Deployments (`distributed/`)](#6-multi-node-distributed-deployments-distributed)
+  - [7. System Tuning & DPDK Utilities (`system-config/`)](#7-system-tuning--dpdk-utilities-system-config)
+- [Cluster Deployment Guide (/etc/pve/scripts/)](#cluster-deployment-guide-etcpvescripts)
+- [Quickstart & Usage Examples](#quickstart--usage-examples)
+- [License](#license)
 
 ---
 
 ## 🌐 Overview
 
-This repository provides modular, idempotent scripts designed to streamline deployment of:
-- **High-Throughput Traffic Generators** (Cisco TRex line-rate packet generator with DPDK and NUMA optimizations)
-- **Network Devices Under Test (DUT)** (VyOS, OpenWrt, MikroTik RouterOS v7 CHR, Debian routing nodes)
-- **Telemetry & Monitoring** (SNMP trap/polling and Syslog collectors)
-- **Automated Security Auditing** (ProjectDiscovery Nuclei scanner LXC)
-- **Enterprise SIEM & XDR** (Wazuh 5 Beta All-in-One LXC and distributed cluster setup)
-
----
-
-## 🏗️ Architecture & Lab Topology
-
-```mermaid
-graph TD
-    subgraph PVE["Proxmox VE Hypervisor Host"]
-        subgraph NET["Virtual Bridges"]
-            vmbr0["vmbr0: Management Network (DHCP / LAN)"]
-            vmbr10["vmbr10: Isolated Measurement WAN (MTU 9000)"]
-            vmbr20["vmbr20: Isolated Measurement LAN (MTU 9000)"]
-        end
-
-        subgraph VMS["High-Performance VMs"]
-            TRex["Cisco TRex Generator VM<br/>• CPU: host (+avx2, +aes)<br/>• Hugepages: 2M<br/>• NUMA: 1<br/>• VirtIO Multiqueue: 4"]
-            DUT["Router DUT VM<br/>(VyOS / OpenWrt / MikroTik / Debian)"]
-        end
-
-        subgraph CTS["LXC Telemetry & Security Containers"]
-            SNMP["SNMP & Syslog Collector LXC<br/>(Debian 12/13 Minimal)"]
-            Nuclei["Nuclei Vulnerability Scanner LXC"]
-            Wazuh["Wazuh 5 SIEM / XDR LXC"]
-        end
-    end
-
-    TRex ---|Port 0: 198.18.1.2| vmbr10
-    vmbr10 ---|WAN Port| DUT
-    DUT ---|LAN Port| vmbr20
-    vmbr20 ---|Port 1: 198.19.1.2| TRex
-
-    TRex -.->|Management Net0| vmbr0
-    DUT -.->|Management Net0| vmbr0
-    SNMP -.->|eth0| vmbr0
-    Nuclei -.->|eth0| vmbr0
-    Wazuh -.->|eth0| vmbr0
-```
+This repository provides centralized, cluster-aware management scripts for Proxmox VE nodes:
+1. **Automated Bare-Metal Host Backups** to Proxmox Backup Server (PBS) with client-side encryption and hook integration into scheduled `vzdump` jobs.
+2. **Batch LXC Provisioning & Hardening** with automatic APT source modernization, post-quantum SSH hardening, user isolation, Chrony sync, and automatic Wazuh Agent onboarding.
+3. **High-Performance Traffic Generators & Router DUTs** (Cisco TRex line-rate packet generator, VyOS, OpenWrt, MikroTik CHR).
+4. **Security & Telemetry Appliances** (ProjectDiscovery Nuclei scanner, SNMP/Syslog collector, Wazuh 5 Beta).
 
 ---
 
@@ -79,35 +43,42 @@ graph TD
 
 ```text
 proxmox-scripts/
-├── .env.example              # Configuration template for credentials, bridges, and storage
-├── .gitignore                # Strictly excludes .env and secret files
-├── LICENSE                   # MIT License
-├── README.md                 # Project documentation and quickstart
-├── docs/
-│   └── PROXMOX_GUIDE.md      # Comprehensive PVE hypervisor DPDK/SR-IOV tuning guide
+├── .env.example                  # Environment configuration template (never commit real .env!)
+├── .gitignore                    # Strictly ignores .env, secret files, keys, and credentials
+├── LICENSE                       # MIT License
+├── README.md                     # Documentation and user guide
+├── backup/
+│   ├── pbs-host-backup.sh        # Standalone bare-metal host backup to Proxmox Backup Server
+│   ├── pbs-host-backup-hook.sh   # Dynamic vzdump hook script (runs host backup on job-start)
+│   └── vzdump-wrapper.sh         # vzdump hook wrapper calling the cluster hook script
+├── provisioning/
+│   ├── autoinstall.sh            # Batch LXC provisioner & hardening engine
+│   ├── nowykontener.sh           # Single LXC provisioner & hardening script
+│   └── setup_lxc.sh -> nowykontener.sh # Convenience symlink
+├── scripts/
+│   └── autoinstall.sh            # Host wrapper forwarding to /etc/pve/scripts/autoinstall.sh
 ├── vms/
-│   ├── create_trex_vm.sh     # Deploy Cisco TRex generator VM with Cloud-Init & DPDK tuning
-│   └── create_dut_vm.sh      # Deploy Router DUT VM (VyOS, OpenWrt, MikroTik, Debian)
+│   ├── create_trex_vm.sh         # Deploy Cisco TRex generator VM with Cloud-Init & DPDK tuning
+│   └── create_dut_vm.sh          # Deploy Router DUT VM (VyOS, OpenWrt, MikroTik, Debian)
 ├── ct/
-│   ├── create_snmp_lxc.sh    # Deploy SNMP & Syslog Telemetry Collector LXC
-│   ├── create_nuclei_lxc.sh  # Deploy ProjectDiscovery Nuclei Scanner LXC
-│   └── wazuh.sh              # Deploy Wazuh 5 Beta All-in-One LXC (Community Scripts style)
+│   ├── create_snmp_lxc.sh        # Deploy SNMP & Syslog Telemetry Collector LXC
+│   ├── create_nuclei_lxc.sh      # Deploy ProjectDiscovery Nuclei Scanner LXC
+│   └── wazuh.sh                  # Deploy Wazuh 5 Beta All-in-One LXC
 ├── install/
-│   ├── install_trex.sh       # TRex DPDK installation & systemd daemon setup (runs inside VM)
-│   ├── install_snmp_collector.sh # SNMP daemon & syslog poller setup (runs inside LXC)
-│   ├── install_nuclei.sh     # Nuclei scanner & templates setup (runs inside LXC)
-│   └── wazuh-install.sh      # Wazuh 5 container install assistant (runs inside LXC)
+│   ├── install_trex.sh           # TRex DPDK installation & systemd daemon setup
+│   ├── install_snmp_collector.sh # SNMP daemon & syslog poller setup
+│   ├── install_nuclei.sh         # Nuclei scanner & templates setup
+│   └── wazuh-install.sh          # Wazuh 5 container install assistant
 ├── distributed/
-│   └── wazuh5-distributed.sh # Multi-node Wazuh 5 cluster installer (Indexer, Manager, Dashboard)
-└── system-config/
-    ├── dpdk-bind.sh          # Automated DPDK driver binding utility (vfio-pci / uio_pci_generic)
-    ├── cpu-affinity.conf     # CPU pinning and core isolation settings
-    ├── grub-tuning.conf      # Linux kernel boot parameters (isolcpus, default_hugepagesz)
-    ├── hugepages.conf        # Hugepages allocation configuration
-    ├── trex.service          # Systemd unit file for TRex server daemon
-    ├── trex_cfg.yaml.template # TRex dual-port DPDK configuration template
-    ├── trex_sriov.yaml       # Hardware SR-IOV configuration profile
-    └── trex_virtio.yaml      # VirtIO software-emulated configuration profile
+│   └── wazuh5-distributed.sh     # Multi-node Wazuh 5 cluster installer
+├── system-config/
+│   ├── dpdk-bind.sh              # Automated DPDK driver binding utility (vfio-pci)
+│   ├── cpu-affinity.conf         # CPU pinning and core isolation settings
+│   ├── grub-tuning.conf          # Kernel boot parameters (isolcpus, default_hugepagesz)
+│   ├── hugepages.conf            # Hugepages allocation configuration
+│   └── trex_cfg.yaml.template    # TRex dual-port DPDK configuration template
+└── docs/
+    └── PROXMOX_GUIDE.md          # Comprehensive PVE hypervisor DPDK/SR-IOV tuning guide
 ```
 
 ---
@@ -116,122 +87,112 @@ proxmox-scripts/
 
 > [!IMPORTANT]
 > **Never commit your `.env` file to Git!**
-> This repository includes `.env` and all credential patterns in `.gitignore`. Real credentials, IP addresses, and custom hypervisor settings should strictly reside in your local `.env`.
+> All real tokens, passwords, encryption keys, and internal domains are kept strictly in your local `.env`.
+> The `.gitignore` file enforces this rule across all branches.
 
-To configure your environment defaults:
+All scripts feature a cluster-aware `load_env` function that checks the following locations in order:
+1. `$(dirname "$0")/.env` (current script directory)
+2. `$(dirname "$0")/../.env` (parent repository directory)
+3. `/etc/pve/scripts/.env` (central shared cluster directory)
+4. `/etc/pve/secrets/.env` (protected cluster secrets directory)
+5. `/etc/pve/.env`
+6. `$HOME/.env`
 
-1. Copy the provided template:
-   ```bash
-   cp .env.example .env
-   ```
-2. Edit `.env` with your preferred settings:
-   ```bash
-   nano .env
-   ```
-3. All deployment scripts automatically detect and source `.env` if present, falling back to sensible interactive defaults if omitted.
-
----
-
-## 💻 Included Scripts & Components
-
-### 1. Virtual Machines (`vms/`)
-
-- **`vms/create_trex_vm.sh`**:
-  - Automatically downloads Debian 13 (Trixie) generic cloud image (`qcow2`).
-  - Configures optimal KVM flags for DPDK: `--cpu host,flags=+aes;+avx;+avx2`, `--numa 1`, `--hugepages 2`.
-  - Provisions 3 network interfaces: Out-of-band management (`vmbr0`) and dual test interfaces (`vmbr10`, `vmbr20`) with VirtIO multiqueue.
-  - Generates isolated measurement bridges (`vmbr10`, `vmbr20`) with 9000 MTU if not already present.
-  - Provisions Cloud-Init credentials and expands storage to 32 GB.
-
-- **`vms/create_dut_vm.sh`**:
-  - Interactive Whiptail menu to choose target router OS: **VyOS**, **OpenWrt**, **MikroTik CHR**, or **Debian**.
-  - Wires interfaces directly into the isolated measurement test loop (`vmbr10` = WAN, `vmbr20` = LAN).
-
-### 2. LXC Containers (`ct/`)
-
-- **`ct/create_snmp_lxc.sh`**:
-  - Provisions an unprivileged Debian LXC container on Proxmox.
-  - Automatically pushes and executes `install/install_snmp_collector.sh`.
-  - Configures SNMPv2c/SNMPv3 trap receiver on port 162/UDP and Syslog receiver on port 514.
-
-- **`ct/create_nuclei_lxc.sh`**:
-  - Provisions an unprivileged Debian LXC container for vulnerability assessment.
-  - Automatically pushes and executes `install/install_nuclei.sh`.
-  - Installs official ProjectDiscovery templates and provides `scan_router.sh` wrapper.
-
-- **`ct/wazuh.sh`**:
-  - Wazuh 5 Beta All-in-One LXC installer following the official **Proxmox Community Helper Scripts** standard.
-  - Automatically detects the newest available Ubuntu template or allows choosing Ubuntu 24.04 LTS.
-
-### 3. Guest Appliance Installers (`install/`)
-
-- **`install/install_trex.sh`**: Full automated Cisco TRex v3.08 installer for Debian 13 guests. Installs DPDK dependencies, downloads official releases, prepares Python virtual environments, and installs `trex.service`.
-- **`install/install_snmp_collector.sh`**: Complete SNMP & Syslog daemon configuration with Python background poller.
-- **`install/install_nuclei.sh`**: Automated binary installer for ProjectDiscovery Nuclei and template updater.
-- **`install/wazuh-install.sh`**: Internal container setup runner for Wazuh 5 Beta.
-
-### 4. Multi-Node Distributed Deployments (`distributed/`)
-
-- **`distributed/wazuh5-distributed.sh`**:
-  - Automated deployment of enterprise multi-node Wazuh 5 Beta clusters across 3 dedicated LXC containers:
-    - Container 1: **Wazuh Indexer** (Elasticsearch/OpenSearch compatible data node)
-    - Container 2: **Wazuh Manager** (Core SIEM/XDR analysis engine)
-    - Container 3: **Wazuh Dashboard** (Web GUI and analytics visualization)
-  - Handles cluster token generation, certificate exchange, and automated cross-node verification.
-
-### 5. System Tuning & DPDK Utilities (`system-config/`)
-
-- **`system-config/dpdk-bind.sh`**: Bind and unbind network cards to DPDK user-space drivers (`vfio-pci`, `uio_pci_generic`) with safe fallback for non-IOMMU hypervisors.
-- **GRUB & Kernel configs**: Pre-configured isolcpus, hugepage allocations (2M and 1G), and NUMA pinning definitions.
+### Setting up `.env`:
+```bash
+cp .env.example .env
+nano .env
+```
 
 ---
 
-## 🚀 Getting Started
+## 💻 Included Scripts & Modules
 
-### Prerequisites
-- A running **Proxmox VE 8.x or 9.x** host node.
-- Root shell access (SSH or PVE Web UI console).
+### 1. Host Bare-Metal Backups to PBS (`backup/`)
 
-### Quickstart Execution on Proxmox Node
+- **`backup/pbs-host-backup.sh`**:
+  - Performs root filesystem (`/`) and `/etc/pve` backup to Proxmox Backup Server using `proxmox-backup-client`.
+  - Supports client-side AES-GCM encryption with `--crypt-mode encrypt --keyfile "$PBS_KEYFILE"`.
+  - Backs up into a designated PBS namespace (e.g. `BareMetal`).
+  - Automatically excludes `/dev`, `/proc`, `/sys`, `/run`, `/var/lib/lxc`, `/var/lib/vz`, `/mnt/pve`, and caches.
+  - Sourced from `.env`: `PBS_REPOSITORY`, `PBS_PASSWORD`, `PBS_FINGERPRINT`, `PBS_KEYFILE`, `PBS_NAMESPACE`.
 
-1. **Clone the repository on your Proxmox host:**
-   ```bash
-   git clone https://github.com/hubertges/proxmox-scripts.git
-   cd proxmox-scripts
-   ```
+- **`backup/pbs-host-backup-hook.sh` & `backup/vzdump-wrapper.sh`**:
+  - Integration with Proxmox scheduled backup jobs (`vzdump`).
+  - Executes during the `job-start` phase, backing up the hypervisor host right as the container/VM backup job begins.
+  - Dynamically reads the node hostname (`$(hostname)`).
 
-2. **Configure environment settings (optional):**
-   ```bash
-   cp .env.example .env
-   nano .env
-   ```
+### 2. LXC Provisioning & Security Hardening (`provisioning/`)
 
-3. **Deploy Cisco TRex Generator VM:**
-   ```bash
-   bash vms/create_trex_vm.sh
-   ```
+- **`provisioning/nowykontener.sh`** (Single container) & **`provisioning/autoinstall.sh`** (Batch mode):
+  - **OS Compatibility**: Ubuntu, Debian 12 (Bookworm), Debian 13 (Trixie), TurnKey Linux.
+  - **SSH Hardening**: Disables root login (`PermitRootLogin no`), disables password login (`PasswordAuthentication no`), enables post-quantum key exchange (`sntrup761x25519-sha512@openssh.com`) and ED25519.
+  - **User Configuration**: Creates non-root administrative user (e.g., `hubi`), sets up Fish shell with `fastfetch` and `cowsay`/`fortune`.
+  - **System Hardening**: Installs `ufw`, `fail2ban`, `unattended-upgrades`, `needrestart`, `debsums`, `rkhunter`.
+  - **Wazuh Agent Integration**: Automatically downloads and installs `wazuh-agent`, connects to `WAZUH_MANAGER`, and assigns to `WAZUH_AGENT_GROUP`.
+  - **Chrony & Clock**: Synchronizes chrony configuration and enables `-x` slew mode for LXC compatibility.
+  - **Password Vault**: Automatically generates strong random root passwords and records them in `$HASLA_FILE` (`/etc/pve/secrets/.hasla`).
 
-4. **Deploy Router DUT VM:**
-   ```bash
-   bash vms/create_dut_vm.sh
-   ```
+### 3. Virtual Machines (`vms/`)
 
-5. **Deploy SNMP Telemetry Collector LXC:**
-   ```bash
-   bash ct/create_snmp_lxc.sh
-   ```
+- **`vms/create_trex_vm.sh`**: Cisco TRex traffic generator VM with Debian 13 cloud image, NUMA, 2M hugepages, multiqueue VirtIO, and isolated measurement bridges (`vmbr10`/`vmbr20`).
+- **`vms/create_dut_vm.sh`**: Router Device Under Test (DUT) deployment for VyOS, OpenWrt, MikroTik RouterOS v7 CHR, or Debian.
 
-6. **Deploy Wazuh 5 All-in-One LXC:**
-   ```bash
-   bash ct/wazuh.sh
-   ```
+### 4. Dedicated LXC Containers (`ct/`)
+
+- **`ct/create_snmp_lxc.sh`**: Debian LXC collector for SNMP traps (port 162) and Syslog (port 514).
+- **`ct/create_nuclei_lxc.sh`**: ProjectDiscovery Nuclei vulnerability scanner LXC with official templates.
+- **`ct/wazuh.sh`**: Wazuh 5 Beta All-in-One LXC in Proxmox Community Helper Scripts format.
 
 ---
 
-## 📖 Hypervisor Tuning Guide
+## 🏛️ Cluster Deployment Guide (`/etc/pve/scripts/`)
 
-For detailed technical guidelines on DPDK line-rate benchmarking, SR-IOV PCIe Passthrough, VirtIO multiqueue optimizations, and NUMA memory pinning, refer to:
-👉 **[PROXMOX_GUIDE.md](docs/PROXMOX_GUIDE.md)**
+In a multi-node Proxmox VE cluster, `/etc/pve/` is synchronized across all cluster nodes via `pmxcfs`. Deploying your scripts and `.env` to `/etc/pve/scripts/` makes them immediately available on every hypervisor node in the cluster.
+
+```bash
+# 1. Create central script directory on any cluster node:
+mkdir -p /etc/pve/scripts /etc/pve/secrets
+
+# 2. Copy scripts from this repository:
+cp backup/* /etc/pve/scripts/
+cp provisioning/* /etc/pve/scripts/
+
+# 3. Create cluster environment file:
+cp .env.example /etc/pve/scripts/.env
+nano /etc/pve/scripts/.env
+
+# 4. Secure the cluster secrets:
+chmod 600 /etc/pve/scripts/.env
+chmod 700 /etc/pve/secrets
+
+# 5. Set up the vzdump backup hook in /etc/vzdump.conf (on each node or globally):
+echo "script: /etc/pve/scripts/vzdump-wrapper.sh" >> /etc/vzdump.conf
+```
+
+---
+
+## 🚀 Quickstart & Usage Examples
+
+### Run Bare-Metal Host Backup to PBS:
+```bash
+bash backup/pbs-host-backup.sh
+```
+
+### Provision and Harden a Single LXC Container:
+```bash
+bash provisioning/nowykontener.sh 105
+```
+
+### Batch Provision All Unconfigured Running Containers:
+```bash
+bash provisioning/autoinstall.sh
+```
+
+### Batch Provision Specific Containers:
+```bash
+bash provisioning/autoinstall.sh 101 102 103
+```
 
 ---
 
