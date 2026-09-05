@@ -81,6 +81,7 @@ proxmox-scripts/
 ├── distributed/
 │   └── wazuh5-distributed.sh     # Multi-node Wazuh 5 cluster installer
 ├── system-config/
+│   ├── setup_sdn_cluster_net.sh  # Automated Proxmox SDN VNet (Wazuh-cluster-net, VLAN > 1500, 10.69.101.0/24)
 │   ├── lxc-auto-provision.service# Systemd service unit for automated LXC provisioning watcher
 │   ├── nginx-zabbix-reverse-proxy.conf # Production Nginx reverse proxy configuration for Zabbix
 │   ├── dpdk-bind.sh              # Automated DPDK driver binding utility (vfio-pci)
@@ -178,7 +179,12 @@ nano .env
 - **`vms/create_trex_vm.sh`**: Cisco TRex traffic generator VM with Debian 13 cloud image, NUMA, 2M hugepages, multiqueue VirtIO, and isolated measurement bridges (`vmbr10`/`vmbr20`).
 - **`vms/create_dut_vm.sh`**: Router Device Under Test (DUT) deployment for VyOS, OpenWrt, MikroTik RouterOS v7 CHR, or Debian.
 
-### 4. Dedicated LXC Containers (`ct/`)
+### 4. Dedicated LXC Containers (`ct/`) & Network Architecture
+
+> [!NOTE]
+> **ProxNET & Automatic Static IP Freezing**:
+> All container creation helper scripts default to network bridge **`ProxNET`** (designed for backend application containers sitting behind an Nginx Reverse Proxy).
+> Containers initially acquire dynamic IPv4 (DHCP) and IPv6 (SLAAC/DHCPv6) addresses on boot, and then the helper scripts automatically freeze those exact addresses and default gateways into permanent **STATIC** configurations in Proxmox VE (`pct set <CTID> -net0 ...`).
 
 - **`ct/create_snmp_lxc.sh`**: Debian LXC collector for SNMP traps (port 162) and Syslog (port 514).
 - **`ct/create_nuclei_lxc.sh`**: ProjectDiscovery Nuclei vulnerability scanner LXC with official templates.
@@ -188,7 +194,27 @@ nano .env
   - Exposes the internal web interface on port `8080` (ready for reverse proxying) and server trapper on port `10051`.
 - **`ct/wazuh.sh`**: Wazuh 5 Beta All-in-One LXC in Proxmox Community Helper Scripts format.
 
-### 5. Guest Appliance Installers (`install/`)
+### 5. Distributed Clusters & SDN Networking (`distributed/` & `system-config/`)
+
+- **`system-config/setup_sdn_cluster_net.sh`**:
+  - Automates the provisioning of an isolated Proxmox Software Defined Network (SDN) VNet:
+    - **SDN Zone**: `ClusterZone` (VLAN mode on `ProxNET`)
+    - **SDN VNet**: `wazuhcl` (Alias: `Wazuh-cluster-net`)
+    - **802.1Q VLAN**: Tag `1669` (VLAN > 1500 for strict cluster isolation)
+    - **Cluster Subnet**: `10.69.101.0/24` (Gateway: `10.69.101.1`), with reserved address space from `10.69.101.0/24` to `10.69.250.0/24` for multi-node service and cluster expansion.
+    - Commits and executes `pvesdn reload`.
+
+- **`distributed/wazuh5-distributed.sh`**:
+  - Deploys a production-grade 3-node **Wazuh 5.0 Beta 5** cluster across dedicated LXC containers (Indexer, Manager, Dashboard).
+  - **Dual-Homed Network Architecture**:
+    - **`net0` (Frontend / Reverse Proxy)**: Connected to bridge `ProxNET`, acquires dynamic IPv4/IPv6 leases and automatically freezes them to static IPs.
+    - **`net1` (Cluster SDN Fabric)**: Connected to SDN VNet `wazuhcl` (or tagged VLAN 1669 fallback) with dedicated static IPs:
+      - **Wazuh Indexer**: `10.69.101.10/24`
+      - **Wazuh Manager**: `10.69.101.11/24`
+      - **Wazuh Dashboard**: `10.69.101.12/24`
+    - Wazuh node-to-node TLS certificates and internal communication (`config.yml`) bind strictly to the high-speed SDN cluster network (`10.69.101.X`), isolating internal OpenSearch replication and event indexing from frontend traffic.
+
+### 6. Guest Appliance Installers (`install/`)
 
 - **`install/install_zabbix.sh`**: Idempotent installer for Zabbix 8.0 LTS, PostgreSQL 17, locales, DB schema import, automated `/etc/zabbix/web/zabbix.conf.php` generation, and external Nginx reverse proxy template generation.
 - **`install/install_trex.sh`**: TRex DPDK installation & systemd daemon setup.
@@ -296,6 +322,28 @@ pct exec <NGINX_CTID> -- sed -i 's/<ZABBIX_CONTAINER_IP>/<YOUR_ZABBIX_IP>/g' /et
 
 # 3. Test and reload Nginx:
 pct exec <NGINX_CTID> -- nginx -t && pct exec <NGINX_CTID> -- systemctl reload nginx
+```
+
+### Setup Proxmox Software Defined Network (SDN) Cluster Network:
+```bash
+# Creates SDN Zone, VNet 'wazuhcl' (Wazuh-cluster-net, VLAN 1669), and Subnet 10.69.101.0/24
+bash system-config/setup_sdn_cluster_net.sh
+```
+
+### Deploy Wazuh 5.0 Beta 5 Distributed Cluster (3 Containers with Dual Networks):
+```bash
+# Creates Indexer, Manager, and Dashboard on ProxNET + Wazuh-cluster-net SDN
+bash distributed/wazuh5-distributed.sh
+```
+
+### Deploy ProjectDiscovery Nuclei Scanner LXC:
+```bash
+bash ct/create_nuclei_lxc.sh
+```
+
+### Deploy SNMP & Syslog Telemetry Collector LXC:
+```bash
+bash ct/create_snmp_lxc.sh
 ```
 
 ---

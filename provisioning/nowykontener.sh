@@ -482,6 +482,35 @@ if [[ -n "$SEARCH_DOMAIN" ]]; then
     pct set "$CTID" -searchdomain "$SEARCH_DOMAIN"
 fi
 
+# Opcjonalne/automatyczne zamrożenie dzierżawy DHCP/SLAAC na stały adres statyczny w PVE
+FREEZE_NET="${FREEZE_NETWORK_STATIC:-true}"
+if [[ "$FREEZE_NET" == "true" ]]; then
+    NET0_CONF=$(pct config "$CTID" 2>/dev/null | grep '^net0:' || true)
+    if [[ "$NET0_CONF" =~ "ip=dhcp" || "$NET0_CONF" =~ "ip6=auto" || "$NET0_CONF" =~ "bridge=ProxNET" ]]; then
+        echo "[+] Sprawdzanie i zamrażanie dzierżawy DHCP/SLAAC na adres statyczny w Proxmox VE..."
+        IP4_CIDR=$(pct exec "$CTID" -- ip -4 -o addr show dev eth0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)
+        GW4=$(pct exec "$CTID" -- ip -4 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+        [[ -z "$GW4" ]] && GW4=$(pct exec "$CTID" -- ip -4 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+
+        IP6_CIDR=$(pct exec "$CTID" -- ip -6 -o addr show dev eth0 scope global 2>/dev/null | grep -v 'tentative' | awk '{print $4}' | head -n1 || true)
+        GW6=$(pct exec "$CTID" -- ip -6 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+        [[ -z "$GW6" ]] && GW6=$(pct exec "$CTID" -- ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+
+        BR_NAME=$(echo "$NET0_CONF" | grep -oP 'bridge=\K[^,]+' || echo "ProxNET")
+
+        if [[ -n "$IP4_CIDR" ]]; then
+            NEW_NET0="name=eth0,bridge=${BR_NAME},firewall=0,ip=${IP4_CIDR}"
+            [[ -n "$GW4" ]] && NEW_NET0+=",gw=${GW4}"
+            if [[ -n "$IP6_CIDR" ]]; then
+                NEW_NET0+=",ip6=${IP6_CIDR}"
+                [[ -n "$GW6" ]] && NEW_NET0+=",gw6=${GW6}"
+            fi
+            echo "[+] Ustawiono statyczny adres IP w Proxmox VE: IPv4=${IP4_CIDR} (GW: ${GW4:-brak})${IP6_CIDR:+, IPv6=${IP6_CIDR}}"
+            pct set "$CTID" -net0 "$NEW_NET0" >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
 # Restarts & Cleanup
 echo "[+] Restartowanie usług sieciowych i czyszczenie..."
 pct exec "$CTID" -- /bin/sh -c "systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || rc-service sshd restart 2>/dev/null || /etc/init.d/ssh restart 2>/dev/null || /etc/init.d/sshd restart 2>/dev/null || true"

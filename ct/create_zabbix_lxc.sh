@@ -183,6 +183,62 @@ select_storage() {
     echo "$selected"
 }
 
+# Helper: Fetch dynamic IPv4 & IPv6 leases from ProxNET and freeze them as STATIC in Proxmox VE
+freeze_container_network() {
+    local ctid="$1"
+    local bridge="$2"
+
+    echo -e "${YW}[*] Waiting for network lease (IPv4 & IPv6) on bridge '${bridge}'...${CL}"
+    local ip4_cidr="" gw4="" ip6_cidr="" gw6=""
+    
+    # Wait for IPv4 lease
+    for i in {1..30}; do
+        ip4_cidr=$(pct exec "$ctid" -- ip -4 -o addr show dev eth0 scope global 2>/dev/null | awk '{print $4}' | head -n1 || true)
+        if [[ -n "$ip4_cidr" ]]; then
+            break
+        fi
+        sleep 1
+    done
+
+    # Give IPv6 SLAAC / DHCPv6 a few seconds to finish router solicitation & DAD
+    for i in {1..10}; do
+        ip6_cidr=$(pct exec "$ctid" -- ip -6 -o addr show dev eth0 scope global 2>/dev/null | grep -v 'tentative' | awk '{print $4}' | head -n1 || true)
+        if [[ -n "$ip6_cidr" ]]; then
+            break
+        fi
+        sleep 1
+    done
+
+    gw4=$(pct exec "$ctid" -- ip -4 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+    [[ -z "$gw4" ]] && gw4=$(pct exec "$ctid" -- ip -4 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+
+    gw6=$(pct exec "$ctid" -- ip -6 route show default dev eth0 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+    [[ -z "$gw6" ]] && gw6=$(pct exec "$ctid" -- ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1 || true)
+
+    local net_str="name=eth0,bridge=${bridge},firewall=0"
+    if [[ -n "$ip4_cidr" ]]; then
+        net_str+=",ip=${ip4_cidr}"
+        [[ -n "$gw4" ]] && net_str+=",gw=${gw4}"
+        echo -e "${GN}[+] Acquired IPv4: ${ip4_cidr} (Gateway: ${gw4:-none})${CL}"
+    else
+        net_str+=",ip=dhcp"
+        echo -e "${YW}[!] IPv4 not acquired via DHCP within timeout, keeping dhcp.${CL}"
+    fi
+
+    if [[ -n "$ip6_cidr" ]]; then
+        net_str+=",ip6=${ip6_cidr}"
+        [[ -n "$gw6" ]] && net_str+=",gw6=${gw6}"
+        echo -e "${GN}[+] Acquired IPv6: ${ip6_cidr} (Gateway: ${gw6:-none})${CL}"
+    fi
+
+    echo -e "${BL}[*] Locking network lease into STATIC IP configuration in Proxmox VE (pct set)...${CL}"
+    pct set "$ctid" -net0 "$net_str" >/dev/null 2>&1 || true
+
+    CT_IP_V4="${ip4_cidr%%/*}"
+    CT_IP_V6="${ip6_cidr%%/*}"
+    CT_IP="${CT_IP_V4:-DHCP}"
+}
+
 clear
 cat << "BANNER"
   _____ _____ ____  ____ _____  __   ___    ___  
@@ -211,7 +267,7 @@ if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
         RAM="${ZABBIX_RAM_MB:-4096}"
         SWAP="${ZABBIX_SWAP_MB:-1024}"
         DISK="${ZABBIX_DISK_GB:-16}"
-        MGMT_BR="${MGMT_BRIDGE:-vmbr0}"
+        MGMT_BR="${MGMT_BRIDGE:-ProxNET}"
         STORAGE=$(select_storage "rootdir" "Select Storage for Container Rootfs" "${DEFAULT_STORAGE:-}")
     else
         # Advanced Settings
@@ -236,8 +292,8 @@ if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
 
         STORAGE=$(select_storage "rootdir" "Select Storage for Container Rootfs" "${DEFAULT_STORAGE:-}")
 
-        MGMT_BR=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Network Bridge:" 8 58 "${MGMT_BRIDGE:-vmbr0}" --title "BRIDGE" 3>&1 1>&2 2>&3 || echo "${MGMT_BRIDGE:-vmbr0}")
-        MGMT_BR="${MGMT_BR:-vmbr0}"
+        MGMT_BR=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Network Bridge (ProxNET for Reverse Proxy):" 8 58 "${MGMT_BRIDGE:-ProxNET}" --title "BRIDGE" 3>&1 1>&2 2>&3 || echo "${MGMT_BRIDGE:-ProxNET}")
+        MGMT_BR="${MGMT_BR:-ProxNET}"
     fi
 else
     CTID="${ZABBIX_CTID:-$NEXT_ID}"
@@ -246,7 +302,7 @@ else
     RAM="${ZABBIX_RAM_MB:-4096}"
     SWAP="${ZABBIX_SWAP_MB:-1024}"
     DISK="${ZABBIX_DISK_GB:-16}"
-    MGMT_BR="${MGMT_BRIDGE:-vmbr0}"
+    MGMT_BR="${MGMT_BRIDGE:-ProxNET}"
     STORAGE=$(select_storage "rootdir" "Select Storage for Container Rootfs" "${DEFAULT_STORAGE:-}")
 fi
 
@@ -274,8 +330,8 @@ else
     echo -e "${GN}[+] Container template ${CHOSEN_TMPL} already available on storage '${TMPL_STORAGE}'.${CL}"
 fi
 
-# 3. Create Unprivileged LXC Container
-echo -e "${BL}[*] Creating LXC Container [CTID: ${CTID}, Hostname: ${HOSTNAME}]...${CL}"
+# 3. Create Unprivileged LXC Container on ProxNET with DHCP & SLAAC
+echo -e "${BL}[*] Creating LXC Container [CTID: ${CTID}, Hostname: ${HOSTNAME}] on bridge '${MGMT_BR}'...${CL}"
 pct create "$CTID" "${TMPL_STORAGE}:vztmpl/${CHOSEN_TMPL}" \
     --hostname "$HOSTNAME" \
     --ostype debian \
@@ -284,7 +340,7 @@ pct create "$CTID" "${TMPL_STORAGE}:vztmpl/${CHOSEN_TMPL}" \
     --swap "$SWAP" \
     --storage "$STORAGE" \
     --rootfs "${STORAGE}:${DISK}" \
-    --net0 "name=eth0,bridge=${MGMT_BR},firewall=0,ip=dhcp" \
+    --net0 "name=eth0,bridge=${MGMT_BR},firewall=0,ip=dhcp,ip6=auto" \
     --features nesting=1 \
     --unprivileged 1 \
     --onboot 1
@@ -294,7 +350,10 @@ echo -e "${YW}[*] Starting container ${CTID}...${CL}"
 pct start "$CTID"
 sleep 5
 
-# 5. Execute Zabbix 8.0 Installation Inside Container
+# 5. Lock DHCP/SLAAC lease into STATIC IP configuration
+freeze_container_network "$CTID" "$MGMT_BR"
+
+# 6. Execute Zabbix 8.0 Installation Inside Container
 echo -e "${BL}[*] Installing PostgreSQL 17, Zabbix 8.0, Agent 2, and Web Frontend...${CL}"
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/install/install_zabbix.sh"
@@ -320,27 +379,18 @@ else
     exit 1
 fi
 
-echo -e "${YW}[*] Waiting for container network interface and IP allocation...${CL}"
-CT_IP=""
-for i in {1..15}; do
-    CT_IP=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || true)
-    if [[ -n "$CT_IP" ]]; then
-        break
-    fi
-    sleep 1
-done
-CT_IP="${CT_IP:-DHCP}"
-
 echo -e "\n${GN}========================================================================${CL}"
 echo -e "${GN}  Zabbix 8.0 LTS LXC Container Deployed! [CTID: ${CTID}]                 ${CL}"
 echo -e "${GN}========================================================================${CL}"
-echo -e "Container IP:         ${BL}${CT_IP}${CL}"
+echo -e "Network Bridge:       ${BL}${MGMT_BR}${CL} (Reverse Proxy Backend Network)"
+echo -e "Static IPv4 Address:  ${BL}${CT_IP}${CL}"
+[[ -n "${CT_IP_V6:-}" ]] && echo -e "Static IPv6 Address:  ${BL}${CT_IP_V6}${CL}"
 echo -e "Internal Web GUI:     ${BL}http://${CT_IP}:8080${CL}"
 echo -e "Default Web Login:    ${YW}Admin${CL} / ${YW}zabbix${CL}"
 echo -e "Zabbix Server Port:   ${BL}${CT_IP}:10051 (TCP)${CL}"
 echo -e "Console Access:       ${BL}pct enter ${CTID}${CL}"
-echo -e "\n${YW}--> External Nginx Configuration:${CL}"
-echo -e "Nginx reverse proxy configuration template for your other container:"
+echo -e "\n${YW}--> External Nginx Configuration (ProxNET):${CL}"
+echo -e "Nginx reverse proxy configuration template for your Nginx container:"
 echo -e "${BL}${REPO_DIR}/system-config/nginx-zabbix-reverse-proxy.conf${CL}"
 echo -e "Add it to ${YW}/etc/nginx/conf.d/zabbix.conf${CL} on your Nginx container with:"
 echo -e "  ${BL}server ${CT_IP}:8080;${CL}\n"
