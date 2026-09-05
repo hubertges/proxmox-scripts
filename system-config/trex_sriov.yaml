@@ -1,0 +1,23 @@
+# system-config/trex_sriov.yaml
+# Cisco TRex Configuration for Enterprise Hardware / Proxmox SR-IOV Passthrough
+# Designed for wire-rate 10Gbps/25Gbps/40Gbps line-rate testing (Intel 82599/X710/E810)
+
+- version: 2
+  port_limit: 2
+  # PCI bus addresses of high-speed NIC ports (run 'dpdk_nic_bind.py -s')
+  interfaces: ['0000:03:00.0', '0000:03:00.1']
+  port_info:
+    - ip: 198.18.1.2
+      default_gw: 198.18.1.1
+      dest_mac: '00:0c:29:ab:cd:01' # DUT Port 0 MAC
+      src_mac: '3c:fd:fe:aa:bb:01'  # TRex Port 0 MAC
+    - ip: 198.19.1.2
+      default_gw: 198.19.1.1
+      dest_mac: '00:0c:29:ab:cd:02' # DUT Port 1 MAC
+      src_mac: '3c:fd:fe:aa:bb:02'  # TRex Port 1 MAC
+  platform:
+    master_thread_id: 0
+    latency_thread_id: 2 # Dedicated isolated physical core
+    dual_if:
+      - socket: 0
+        threads: [4, 6, 8, 10, 12, 14] # Dedicated physical P-cores

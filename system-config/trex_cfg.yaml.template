@@ -1,0 +1,33 @@
+# /etc/trex_cfg.yaml
+# Cisco TRex Configuration Template for High-Performance Router Benchmarking
+# Master Template with Academic Architecture Documentation
+
+- version: 2
+  port_limit: 2
+  # PCI addresses of the two testing interfaces connected to the DUT (Router under test)
+  # Port 0 connects to DUT WAN interface; Port 1 connects to DUT LAN interface
+  interfaces: ['{{PCI_PORT_0}}', '{{PCI_PORT_1}}']
+
+  port_info:
+    - ip: {{TREX_IP_PORT_0}}
+      default_gw: {{DUT_IP_PORT_0}}
+      dest_mac: '{{DUT_MAC_PORT_0}}'
+      src_mac: '{{TREX_MAC_PORT_0}}'
+    - ip: {{TREX_IP_PORT_1}}
+      default_gw: {{DUT_IP_PORT_1}}
+      dest_mac: '{{DUT_MAC_PORT_1}}'
+      src_mac: '{{TREX_MAC_PORT_1}}'
+
+  platform:
+    # Dedicated management / JSON-RPC / CLI core
+    master_thread_id: {{MASTER_CORE}}
+    # Dedicated latency & RX packet tracking core (MUST be separate from master and worker cores)
+    latency_thread_id: {{LATENCY_CORE}}
+    dual_if:
+      - socket: {{NUMA_SOCKET}}
+        # DPDK Polling Worker Threads assigned to interface pair [0, 1]
+        threads: {{WORKER_CORES}}
+
+  # Optional memory pool limits (in MB per NUMA socket)
+  memory:
+    dpdk_single_core: false

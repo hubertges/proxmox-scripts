@@ -1,0 +1,18 @@
+[Unit]
+Description=Cisco TRex Realistic Traffic Generator Daemon
+Documentation=https://trex-tgn.cisco.com/trex/doc/
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trex/current
+ExecStart=/opt/trex/current/t-rex-64 -i --no-scapy-server
+Restart=on-failure
+RestartSec=5s
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

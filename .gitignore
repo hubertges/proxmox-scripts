@@ -1,0 +1,39 @@
+# ==============================================================================
+# Environment & Secrets (CRITICAL: Do NOT remove)
+# ==============================================================================
+.env
+.env.*
+!.env.example
+*.env
+*.envrc
+*.local
+
+# Credentials & SSH Keys
+*.key
+*.pem
+*.cer
+*.crt
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+*_creds
+*credentials*
+*.creds
+
+# Logs & Temporary Files
+*.log
+*.tmp
+tmp/
+temp/
+results/
+*.csv
+*.jsonl
+
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

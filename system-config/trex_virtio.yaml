@@ -1,0 +1,27 @@
+# system-config/trex_virtio.yaml
+# Cisco TRex Configuration for Proxmox KVM Virtual Machine with VirtIO-Net
+# Suitable for lab evaluation and functional test automation without dedicated SRIOV NICs.
+#
+# Proxmox VM Requirements:
+# 1. CPU type: "host"
+# 2. Network cards: 2x VirtIO-Net interfaces with multiqueue (queues=4)
+# 3. In guest Debian: modprobe vfio-pci; echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+
+- version: 2
+  port_limit: 2
+  interfaces: ['00:10.0', '00:11.0'] # Adjust to 'lspci | grep Ethernet' inside VM
+  port_info:
+    - ip: 198.18.1.2
+      default_gw: 198.18.1.1
+      dest_mac: '52:54:00:12:34:01' # DUT WAN MAC
+      src_mac: '52:54:00:aa:bb:01'  # TRex Port 0 MAC
+    - ip: 198.19.1.2
+      default_gw: 198.19.1.1
+      dest_mac: '52:54:00:12:34:02' # DUT LAN MAC
+      src_mac: '52:54:00:aa:bb:02'  # TRex Port 1 MAC
+  platform:
+    master_thread_id: 0
+    latency_thread_id: 1
+    dual_if:
+      - socket: 0
+        threads: [2, 3]
