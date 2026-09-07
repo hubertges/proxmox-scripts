@@ -76,14 +76,14 @@ proxmox-scripts/
 ├── ct/
 │   ├── create_snmp_lxc.sh        # Deploy SNMP & Syslog Telemetry Collector LXC
 │   ├── create_nuclei_lxc.sh      # Deploy ProjectDiscovery Nuclei Scanner LXC
-│   ├── create_zabbix_lxc.sh      # Deploy Zabbix LTS + MySQL (MariaDB) LXC (Debian 13/12)
-│   ├── zabbix.sh                 # Zabbix LXC (Community-Scripts format)
+│   ├── create_zabbix_lxc.sh      # Forwarding launcher to ct/zabbix.sh
+│   ├── zabbix.sh                 # Deploy Zabbix 8.0+ LTS + PostgreSQL 17 LXC (Proxmox Helper Scripts format)
 │   └── wazuh.sh                  # Deploy Wazuh 5 Beta All-in-One LXC
 ├── install/
 │   ├── install_trex.sh           # TRex DPDK installation & systemd daemon setup
 │   ├── install_snmp_collector.sh # SNMP daemon & syslog poller setup
 │   ├── install_nuclei.sh         # Nuclei scanner & templates setup
-│   ├── install_zabbix.sh         # Zabbix LTS + MySQL (MariaDB) installer for Debian
+│   ├── zabbix-install.sh         # Zabbix 8.0+ LTS + PostgreSQL 17 installer for Debian 13 (Trixie)
 │   └── wazuh-install.sh          # Wazuh 5 container install assistant
 ├── distributed/
 │   └── wazuh5-distributed.sh     # Multi-node Wazuh 5 cluster installer
@@ -214,10 +214,13 @@ nano .env
 
 - **`ct/create_snmp_lxc.sh`**: Debian LXC collector for SNMP traps (port 162) and Syslog (port 514).
 - **`ct/create_nuclei_lxc.sh`**: ProjectDiscovery Nuclei vulnerability scanner LXC with official templates.
-- **`ct/create_zabbix_lxc.sh`** & **`ct/zabbix.sh`**:
-  - Deploys a dedicated **Zabbix LTS** monitoring container on **Debian 13 (Trixie) / 12 (Bookworm)** with **MySQL (MariaDB)**.
-  - Includes Zabbix Server daemon, MySQL / MariaDB database with automated schema initialization, Zabbix Agent 2 with MySQL monitoring credentials, and pre-configured PHP frontend.
-  - Exposes the internal web interface on port `8080` (ready for reverse proxying) and server trapper on port `10051`.
+- **`ct/zabbix.sh`** & **`ct/create_zabbix_lxc.sh`**:
+  - Deploys **Zabbix 8.0+ LTS** monitoring container on **Debian 13 (Trixie)** with **PostgreSQL 17** using native Proxmox Helper Scripts built-in functions.
+  - Interactive GUI dialog (`whiptail`) prompts for administrator & database password.
+  - Fully disables chrony / timesync daemons inside the container to avoid hypervisor clock conflicts.
+  - Automatically provisions from the user's repository (`hubertges/proxmox-scripts`).
+  - Includes Zabbix Server 8.0+, PostgreSQL 17 database with automated schema initialization, Zabbix Agent 2 with PostgreSQL monitoring, and pre-configured web frontend.
+  - Exposes the internal web interface on port `80` and `8080` (ready for reverse proxying) and server trapper on port `10051`.
 - **`ct/wazuh.sh`**: Wazuh 5 Beta All-in-One LXC in Proxmox Community Helper Scripts format.
 
 ### 5. Distributed Clusters & SDN Networking (`distributed/` & `system-config/`)
@@ -242,7 +245,7 @@ nano .env
 
 ### 6. Guest Appliance Installers (`install/`)
 
-- **`install/install_zabbix.sh`**: Idempotent installer for Zabbix LTS, MySQL (MariaDB), locales, DB schema import, automated `/etc/zabbix/web/zabbix.conf.php` generation, and external Nginx reverse proxy template generation.
+- **`install/zabbix-install.sh`**: Native Proxmox Helper Scripts installer for Zabbix 8.0+ LTS, PostgreSQL 17, schema initialization, automated `/etc/zabbix/web/zabbix.conf.php` generation, and chrony elimination.
 - **`install/install_trex.sh`**: TRex DPDK installation & systemd daemon setup.
 - **`install/install_snmp_collector.sh`**: SNMP daemon & syslog poller setup.
 - **`install/install_nuclei.sh`**: Nuclei scanner & templates setup.
