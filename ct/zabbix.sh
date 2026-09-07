@@ -8,7 +8,7 @@ source "$_cs_boot" 2>/dev/null || source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_
 # Source: https://www.zabbix.com/documentation/devel/en/manual
 
 APP="Zabbix"
-var_tags="${var_tags:-monitoring;network;zabbix;postgresql}"
+var_tags="${var_tags:-monitoring;network;zabbix;mysql}"
 var_cpu="${var_cpu:-2}"
 var_ram="${var_ram:-4096}"
 var_disk="${var_disk:-16}"
@@ -30,10 +30,10 @@ function update_script() {
     msg_error "No ${APP} Installation Found!"
     exit 1
   fi
-  msg_info "Updating Zabbix 8.0 & System Packages"
+  msg_info "Updating Zabbix & System Packages"
   $STD apt update
   $STD apt upgrade -y
-  msg_ok "Updated Zabbix 8.0 LXC successfully!"
+  msg_ok "Updated Zabbix LXC successfully!"
   exit
 }
 
@@ -42,7 +42,7 @@ build_container
 description
 
 msg_ok "Completed successfully!\n"
-echo -e "${CREATING}${GN}${APP} 8.0 LTS setup has been successfully initialized!${CL}"
+echo -e "${CREATING}${GN}${APP} LTS setup has been successfully initialized!${CL}"
 echo -e "${INFO}${YW}Internal Web GUI URL:${CL}"
 echo -e "${GATEWAY}${BGN}http://${IP}:8080${CL}"
 echo -e "${INFO}${YW}Default credentials: Admin / zabbix${CL}"

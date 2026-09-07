@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # install/install_zabbix.sh
-# Automated, Idempotent Installer for Zabbix 8.0 LTS with PostgreSQL on Debian 13 (Trixie)
+# Automated, Idempotent Installer for Zabbix LTS with MySQL / MariaDB on Debian
 #
-# Target OS: Debian GNU/Linux 13 (Trixie) - x86_64 / arm64
-# Components: Zabbix Server 8.0, PostgreSQL 17, Zabbix Agent 2, Zabbix Frontend (PHP-FPM + Nginx)
+# Target OS: Debian GNU/Linux 12 (Bookworm) / 13 (Trixie) - x86_64 / arm64
+# Components: Zabbix Server, MySQL (MariaDB), Zabbix Agent 2, Zabbix Frontend (PHP-FPM + Nginx)
 # Documentation: https://www.zabbix.com/documentation/devel/en/manual
 # ==============================================================================
 
@@ -49,6 +49,7 @@ ZABBIX_DB_USER="${ZABBIX_DB_USER:-zabbix}"
 ZABBIX_DB_PASSWORD="${ZABBIX_DB_PASSWORD:-$(openssl rand -hex 16)}"
 ZABBIX_SERVER_PORT="${ZABBIX_SERVER_PORT:-10051}"
 ZABBIX_LOCAL_WEB_PORT="${ZABBIX_LOCAL_WEB_PORT:-8080}"
+ZABBIX_VERSION="${ZABBIX_VERSION:-7.0}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -74,7 +75,11 @@ else
     DEB_VER="12"
 fi
 
-ZABBIX_RELEASE_PKG_URL="https://repo.zabbix.com/zabbix/8.0/release/debian/pool/main/z/zabbix-release/zabbix-release_latest+debian${DEB_VER}_all.deb"
+# Configure Zabbix repository URL (supports Debian 12/13 with fallback)
+ZABBIX_RELEASE_PKG_URL="https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/debian/pool/main/z/zabbix-release/zabbix-release_latest+debian${DEB_VER}_all.deb"
+if ! curl -sI "$ZABBIX_RELEASE_PKG_URL" 2>/dev/null | grep -qE "HTTP/[123.]+ 200"; then
+    ZABBIX_RELEASE_PKG_URL="https://repo.zabbix.com/zabbix/7.0/debian/pool/main/z/zabbix-release/zabbix-release_latest+debian${DEB_VER}_all.deb"
+fi
 
 apt-get update -y
 log_success "Package indices updated."
@@ -115,99 +120,96 @@ export LC_ALL=en_US.UTF-8
 log_success "Base prerequisites and locales configured."
 
 # ------------------------------------------------------------------------------
-# 3. PostgreSQL Installation & Configuration
+# 3. MySQL / MariaDB Installation & Configuration
 # ------------------------------------------------------------------------------
-if [[ "${DEB_VER:-13}" == "12" ]]; then
-    log_info "Configuring PostgreSQL official APT repo for Debian 12..."
-    install -d /etc/apt/keyrings
-    wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg --yes 2>/dev/null || true
-    echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list
-    apt-get update -y
-    apt-get install -y --no-install-recommends postgresql-17 postgresql-contrib-17
-else
-    apt-get install -y --no-install-recommends postgresql postgresql-contrib
-fi
+log_step "3. Installing and Configuring MySQL / MariaDB Server"
 
-systemctl enable --now postgresql
+apt-get install -y --no-install-recommends mariadb-server mariadb-client
+
+systemctl daemon-reload
+systemctl enable --now mariadb 2>/dev/null || systemctl enable --now mysql 2>/dev/null || true
 sleep 2
 
-# Create Zabbix DB user if not present
-USER_EXISTS=$(sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${ZABBIX_DB_USER}'" | tr -d '[:space:]')
-if [[ "$USER_EXISTS" != "1" ]]; then
-    log_info "Creating PostgreSQL role '${ZABBIX_DB_USER}'..."
-    sudo -u postgres psql -c "CREATE USER ${ZABBIX_DB_USER} WITH ENCRYPTED PASSWORD '${ZABBIX_DB_PASSWORD}';"
-else
-    log_info "PostgreSQL role '${ZABBIX_DB_USER}' already exists. Updating password..."
-    sudo -u postgres psql -c "ALTER USER ${ZABBIX_DB_USER} WITH ENCRYPTED PASSWORD '${ZABBIX_DB_PASSWORD}';"
+# Ensure database service is running
+if ! systemctl is-active --quiet mariadb && ! systemctl is-active --quiet mysql; then
+    systemctl start mariadb 2>/dev/null || systemctl start mysql 2>/dev/null || true
+    sleep 2
 fi
 
-# Create Zabbix database if not present
-DB_EXISTS=$(sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${ZABBIX_DB_NAME}'" | tr -d '[:space:]')
-if [[ "$DB_EXISTS" != "1" ]]; then
-    log_info "Creating PostgreSQL database '${ZABBIX_DB_NAME}' with UTF8 encoding..."
-    sudo -u postgres psql -c "CREATE DATABASE ${ZABBIX_DB_NAME} OWNER ${ZABBIX_DB_USER} ENCODING 'UTF8';"
-else
-    log_info "Database '${ZABBIX_DB_NAME}' already exists."
-fi
-log_success "PostgreSQL server ready."
+log_info "Configuring database '${ZABBIX_DB_NAME}' and user '${ZABBIX_DB_USER}'..."
+mysql -u root <<EOF
+CREATE DATABASE IF NOT EXISTS \`${ZABBIX_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+CREATE USER IF NOT EXISTS '${ZABBIX_DB_USER}'@'localhost' IDENTIFIED BY '${ZABBIX_DB_PASSWORD}';
+ALTER USER '${ZABBIX_DB_USER}'@'localhost' IDENTIFIED BY '${ZABBIX_DB_PASSWORD}';
+CREATE USER IF NOT EXISTS '${ZABBIX_DB_USER}'@'127.0.0.1' IDENTIFIED BY '${ZABBIX_DB_PASSWORD}';
+ALTER USER '${ZABBIX_DB_USER}'@'127.0.0.1' IDENTIFIED BY '${ZABBIX_DB_PASSWORD}';
+GRANT ALL PRIVILEGES ON \`${ZABBIX_DB_NAME}\`.* TO '${ZABBIX_DB_USER}'@'localhost';
+GRANT ALL PRIVILEGES ON \`${ZABBIX_DB_NAME}\`.* TO '${ZABBIX_DB_USER}'@'127.0.0.1';
+SET GLOBAL log_bin_trust_function_creators = 1;
+FLUSH PRIVILEGES;
+EOF
+
+log_success "MySQL / MariaDB server ready."
 
 # ------------------------------------------------------------------------------
-# 4. Zabbix 8.0 Repository Setup & Package Installation
+# 4. Zabbix Official Repository Setup & Package Installation
 # ------------------------------------------------------------------------------
-log_step "4. Setting up Zabbix 8.0 Official Repository"
+log_step "4. Setting up Zabbix Official Repository"
 
 REPO_DEB="/tmp/zabbix-release.deb"
 rm -f "$REPO_DEB"
-log_info "Downloading Zabbix 8.0 repository package from ${ZABBIX_RELEASE_PKG_URL}..."
+log_info "Downloading Zabbix repository package from ${ZABBIX_RELEASE_PKG_URL}..."
 wget -qO "$REPO_DEB" "$ZABBIX_RELEASE_PKG_URL"
 dpkg -i "$REPO_DEB"
 rm -f "$REPO_DEB"
 
 apt-get update -y
-log_success "Zabbix 8.0 repository configured."
+log_success "Zabbix repository configured."
 
-log_step "5. Installing Zabbix 8.0 Server, Agent 2, and Frontend Components"
+log_step "5. Installing Zabbix Server (MySQL), Agent 2, and Frontend Components"
 
 ZABBIX_PACKAGES=(
-    zabbix-server-pgsql
+    zabbix-server-mysql
     zabbix-sql-scripts
     zabbix-agent2
-    zabbix-agent2-plugin-postgresql
     zabbix-frontend-php
     zabbix-nginx-conf
+    php-mysql
     nginx
     php-fpm
 )
 
 apt-get install -y --no-install-recommends "${ZABBIX_PACKAGES[@]}"
-log_success "Zabbix 8.0 components installed successfully."
+apt-get install -y --no-install-recommends zabbix-agent2-plugin-mysql 2>/dev/null || true
+log_success "Zabbix components installed successfully."
 
 # ------------------------------------------------------------------------------
 # 6. Database Schema Initialisation
 # ------------------------------------------------------------------------------
 log_step "6. Initialising Zabbix Database Schema"
 
-SCHEMA_FILE="/usr/share/zabbix/sql-scripts/postgresql/server.sql.gz"
+SCHEMA_FILE="/usr/share/zabbix-sql-scripts/mysql/server.sql.gz"
 if [[ ! -f "$SCHEMA_FILE" ]]; then
-    # Fallback search path in case path varies by package version
-    SCHEMA_FILE=$(find /usr/share -type f -name "server.sql.gz" | grep postgresql | head -n1 || true)
+    SCHEMA_FILE="/usr/share/doc/zabbix-sql-scripts/mysql/server.sql.gz"
+fi
+if [[ ! -f "$SCHEMA_FILE" ]]; then
+    SCHEMA_FILE=$(find /usr/share -type f -name "server.sql.gz" 2>/dev/null | grep mysql | head -n1 || true)
 fi
 
 if [[ -f "$SCHEMA_FILE" ]]; then
-    TABLE_COUNT=$(sudo -u postgres psql -d "${ZABBIX_DB_NAME}" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "0")
+    TABLE_COUNT=$(mysql -u root -N -B -e "SELECT count(*) FROM information_schema.tables WHERE table_schema='${ZABBIX_DB_NAME}';" 2>/dev/null || echo "0")
     if [[ "$TABLE_COUNT" -eq 0 ]]; then
         log_info "Importing Zabbix schema from ${SCHEMA_FILE}..."
-        # Import as postgres superuser or zabbix user
-        zcat "$SCHEMA_FILE" | sudo -u postgres psql -d "${ZABBIX_DB_NAME}" >/dev/null
-        # Ensure ownership of all imported tables/sequences to zabbix user
-        sudo -u postgres psql -d "${ZABBIX_DB_NAME}" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${ZABBIX_DB_USER};" >/dev/null
-        sudo -u postgres psql -d "${ZABBIX_DB_NAME}" -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${ZABBIX_DB_USER};" >/dev/null
+        mysql -u root -e "SET GLOBAL log_bin_trust_function_creators = 1;" 2>/dev/null || true
+        zcat "$SCHEMA_FILE" | mysql --default-character-set=utf8mb4 -u root "${ZABBIX_DB_NAME}"
+        mysql -u root -e "SET GLOBAL log_bin_trust_function_creators = 0;" 2>/dev/null || true
+        mysql -u root -e "GRANT ALL PRIVILEGES ON \`${ZABBIX_DB_NAME}\`.* TO '${ZABBIX_DB_USER}'@'localhost'; GRANT ALL PRIVILEGES ON \`${ZABBIX_DB_NAME}\`.* TO '${ZABBIX_DB_USER}'@'127.0.0.1'; FLUSH PRIVILEGES;" 2>/dev/null || true
         log_success "Zabbix database schema imported successfully."
     else
         log_info "Database already populated (${TABLE_COUNT} tables found). Skipping schema import."
     fi
 else
-    log_warn "Schema file not found automatically. Please verify /usr/share/zabbix/sql-scripts/postgresql/."
+    log_warn "Schema file not found automatically. Please verify /usr/share/zabbix-sql-scripts/mysql/."
 fi
 
 # ------------------------------------------------------------------------------
@@ -253,7 +255,7 @@ mkdir -p /etc/zabbix/web
 cat << EOF > /etc/zabbix/web/zabbix.conf.php
 <?php
 // Zabbix GUI configuration file (auto-generated)
-\$DB['TYPE']     = 'POSTGRESQL';
+\$DB['TYPE']     = 'MYSQL';
 \$DB['SERVER']   = 'localhost';
 \$DB['PORT']     = '0';
 \$DB['DATABASE'] = '${ZABBIX_DB_NAME}';
@@ -272,7 +274,7 @@ cat << EOF > /etc/zabbix/web/zabbix.conf.php
 
 \$ZBX_SERVER      = 'localhost';
 \$ZBX_SERVER_PORT = '${ZABBIX_SERVER_PORT}';
-\$ZBX_SERVER_NAME = 'Zabbix 8.0 Monitoring';
+\$ZBX_SERVER_NAME = 'Zabbix Monitoring';
 
 \$IMAGE_FORMAT_DEFAULT = IMAGE_FORMAT_PNG;
 EOF
@@ -282,7 +284,7 @@ chmod 640 /etc/zabbix/web/zabbix.conf.php
 log_success "Zabbix web frontend pre-configured at /etc/zabbix/web/zabbix.conf.php."
 
 # ------------------------------------------------------------------------------
-# 9. Configure Zabbix Agent 2
+# 9. Configure Zabbix Agent 2 & MySQL Monitoring Credentials
 # ------------------------------------------------------------------------------
 log_step "9. Configuring Zabbix Agent 2"
 
@@ -294,6 +296,24 @@ if [[ -f "$AGENT_CONF" ]]; then
     log_success "Configured ${AGENT_CONF}."
 fi
 
+# Configure MySQL monitoring user and .my.cnf for Zabbix Agent 2
+log_info "Configuring MySQL monitoring credentials for Zabbix Agent 2..."
+mysql -u root <<EOF 2>/dev/null || true
+CREATE USER IF NOT EXISTS 'zbx_monitor'@'localhost' IDENTIFIED BY '${ZABBIX_DB_PASSWORD}';
+ALTER USER 'zbx_monitor'@'localhost' IDENTIFIED BY '${ZABBIX_DB_PASSWORD}';
+GRANT REPLICATION CLIENT, PROCESS, SHOW DATABASES, SHOW VIEW ON *.* TO 'zbx_monitor'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+mkdir -p /var/lib/zabbix
+cat << EOF > /var/lib/zabbix/.my.cnf
+[client]
+user = zbx_monitor
+password = ${ZABBIX_DB_PASSWORD}
+EOF
+chown -R zabbix:zabbix /var/lib/zabbix 2>/dev/null || true
+chmod 600 /var/lib/zabbix/.my.cnf 2>/dev/null || true
+
 # ------------------------------------------------------------------------------
 # 10. Enable and Start Services
 # ------------------------------------------------------------------------------
@@ -303,7 +323,9 @@ log_step "10. Enabling and Starting Services"
 PHP_FPM_SVC=$(systemctl list-unit-files --type=service 2>/dev/null | grep -oE 'php[0-9.]*-fpm\.service' | head -n1 || echo "php-fpm.service")
 
 systemctl daemon-reload
-systemctl enable --now postgresql
+systemctl enable --now mariadb 2>/dev/null || systemctl enable --now mysql 2>/dev/null || true
+systemctl restart mariadb 2>/dev/null || systemctl restart mysql 2>/dev/null || true
+
 systemctl enable --now zabbix-server
 systemctl enable --now zabbix-agent2
 if systemctl list-unit-files | grep -q "$PHP_FPM_SVC"; then
@@ -321,7 +343,7 @@ fi
 
 systemctl restart zabbix-server
 systemctl restart zabbix-agent2
-log_success "All Zabbix 8.0 services enabled and started."
+log_success "All Zabbix services enabled and started."
 
 # ------------------------------------------------------------------------------
 # 11. Generate External Nginx Reverse Proxy Configuration & Save Credentials
@@ -333,13 +355,13 @@ PROXY_CONF="/etc/zabbix/nginx-external-reverse-proxy.conf"
 
 cat << EOF > "$PROXY_CONF"
 # ==============================================================================
-# Nginx Reverse Proxy Configuration for Zabbix 8.0 LTS
+# Nginx Reverse Proxy Configuration for Zabbix
 # Add this configuration to your EXTERNAL Nginx container/server!
 # Location on external Nginx container: /etc/nginx/conf.d/zabbix.conf
 # ==============================================================================
 
 upstream zabbix_backend {
-    # Points to the Zabbix 8.0 LXC container internal web listener:
+    # Points to the Zabbix LXC container internal web listener:
     server ${CT_IP}:${ZABBIX_LOCAL_WEB_PORT};
     keepalive 32;
 }
@@ -371,7 +393,7 @@ server {
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
 
-    # WebSocket support for Zabbix 7/8 live updates and dashboards
+    # WebSocket support for Zabbix live updates and dashboards
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection \$connection_upgrade;
 
@@ -379,45 +401,16 @@ server {
         proxy_pass http://zabbix_backend;
     }
 }
-
-# Optional HTTPS Virtual Host with SSL Termination:
-# server {
-#     listen 443 ssl http2;
-#     server_name zabbix.yourdomain.local;
-#
-#     ssl_certificate     /etc/ssl/certs/zabbix.crt;
-#     ssl_certificate_key /etc/ssl/private/zabbix.key;
-#     ssl_protocols       TLSv1.2 TLSv1.3;
-#     ssl_ciphers         HIGH:!aNULL:!MD5;
-#
-#     client_max_body_size 64M;
-#     proxy_connect_timeout 60s;
-#     proxy_send_timeout    600s;
-#     proxy_read_timeout    600s;
-#
-#     proxy_http_version 1.1;
-#     proxy_set_header Connection "";
-#     proxy_set_header Host \$host;
-#     proxy_set_header X-Real-IP \$remote_addr;
-#     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-#     proxy_set_header X-Forwarded-Proto https;
-#     proxy_set_header Upgrade \$http_upgrade;
-#     proxy_set_header Connection \$connection_upgrade;
-#
-#     location / {
-#         proxy_pass http://zabbix_backend;
-#     }
-# }
 EOF
 
 CREDS_FILE="/etc/zabbix/zabbix_credentials.txt"
 cat << EOF > "$CREDS_FILE"
-# Zabbix 8.0 Deployment Credentials & Details
+# Zabbix Deployment Credentials & Details
 Generated: $(date -u)
-Target OS: Debian 13 (Trixie)
+Target OS: Debian ${DEB_VER} (${CURRENT_CODENAME})
 Container IP: ${CT_IP}
 
-[Database - PostgreSQL 17]
+[Database - MySQL / MariaDB]
 DB Name:     ${ZABBIX_DB_NAME}
 DB User:     ${ZABBIX_DB_USER}
 DB Password: ${ZABBIX_DB_PASSWORD}
@@ -440,13 +433,13 @@ cp "$CREDS_FILE" /root/zabbix_credentials.txt 2>/dev/null || true
 
 log_step "Installation Summary"
 echo -e "${GREEN}========================================================================${NC}"
-echo -e "${GREEN}  Zabbix 8.0 with PostgreSQL 17 Installed Successfully!                 ${NC}"
+echo -e "${GREEN}  Zabbix with MySQL / MariaDB Installed Successfully!                   ${NC}"
 echo -e "${GREEN}========================================================================${NC}"
 echo -e "Container IP:              ${BLUE}${CT_IP}${NC}"
 echo -e "Zabbix Server Port:        ${BLUE}${ZABBIX_SERVER_PORT}${NC}"
 echo -e "Internal Web GUI:          ${BLUE}http://${CT_IP}:${ZABBIX_LOCAL_WEB_PORT}${NC}"
 echo -e "Default Web Login:         ${YELLOW}Admin${NC} / ${YELLOW}zabbix${NC}"
-echo -e "PostgreSQL Database:       ${YELLOW}${ZABBIX_DB_NAME}${NC} (User: ${YELLOW}${ZABBIX_DB_USER}${NC})"
+echo -e "MySQL Database:            ${YELLOW}${ZABBIX_DB_NAME}${NC} (User: ${YELLOW}${ZABBIX_DB_USER}${NC})"
 echo -e "Database Password saved:   ${BLUE}${CREDS_FILE}${NC}"
 echo -e "\n${BOLD}${YELLOW}--> External Nginx Configuration:${NC}"
 echo -e "A reverse proxy configuration for your other Nginx container has been generated at:"

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ct/create_zabbix_lxc.sh
-# Proxmox VE Helper Script: Automated Zabbix 8.0 LTS + PostgreSQL 17 LXC Deployment
+# Proxmox VE Helper Script: Automated Zabbix LTS + MySQL (MariaDB) LXC Deployment
 # Style: Proxmox Community Helper Scripts (tteck / community-scripts standard)
 #
 # Target Hypervisor: Proxmox VE 8.x / 9.x
-# Target Container:  Debian GNU/Linux 13 (Trixie) - Unprivileged LXC
-# Components:        Zabbix Server 8.0, PostgreSQL 17, Zabbix Agent 2, Web GUI
+# Target Container:  Debian GNU/Linux 13 (Trixie) / 12 (Bookworm) - Unprivileged LXC
+# Components:        Zabbix Server, MySQL (MariaDB), Zabbix Agent 2, Web GUI
 # Documentation:     https://www.zabbix.com/documentation/devel/en/manual
 # ==============================================================================
 
@@ -192,9 +192,9 @@ cat << "BANNER"
    / / | |_| |  _ \|  _ \ | |    \ V / _ \| | | |
   / /_ |  _  | |_) | |_) || |     | / ___ \ |_| |
  /____||_| |_|____/|____/ |_|     |/_/   \_\___/ 
-  Proxmox VE Helper Script: Zabbix 8.0 LTS + PostgreSQL 17
+  Proxmox VE Helper Script: Zabbix LTS + MySQL (MariaDB)
 BANNER
-echo -e "${BL}Enterprise Monitoring Platform on Debian 13 (Trixie) LXC${CL}\n"
+echo -e "${BL}Enterprise Monitoring Platform on Debian LXC${CL}\n"
 
 # 1. Interactive Parameter Selection (Proxmox Helper Scripts standard)
 NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
@@ -204,7 +204,7 @@ if command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
         --title "SETTINGS" \
         --yes-button "Default" \
         --no-button "Advanced" \
-        --yesno "Use Default Settings for Zabbix 8.0 LTS LXC Container?" 10 58; then
+        --yesno "Use Default Settings for Zabbix LTS LXC Container?" 10 58; then
         # Default Settings
         echo -e "${BL}Using Default Settings${CL}"
         CTID="${ZABBIX_CTID:-$NEXT_ID}"
@@ -300,8 +300,8 @@ echo -e "${YW}[*] Starting container ${CTID}...${CL}"
 pct start "$CTID"
 sleep 5
 
-# 5. Execute Zabbix 8.0 Installation Inside Container
-echo -e "${BL}[*] Installing PostgreSQL 17, Zabbix 8.0, Agent 2, and Web Frontend...${CL}"
+# 5. Execute Zabbix Installation Inside Container
+echo -e "${BL}[*] Installing MySQL / MariaDB, Zabbix, Agent 2, and Web Frontend...${CL}"
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/install/install_zabbix.sh"
 
@@ -337,7 +337,7 @@ CT_IP="${CT_IP:-DHCP}"
 CT_IP_V6=$(pct exec "$CTID" -- ip -6 addr show eth0 scope global 2>/dev/null | awk '/inet6 / {print $2}' | cut -d/ -f1 | head -n1 || true)
 
 echo -e "\n${GN}========================================================================${CL}"
-echo -e "${GN}  Zabbix 8.0 LTS LXC Container Deployed! [CTID: ${CTID}]                 ${CL}"
+echo -e "${GN}  Zabbix LTS LXC Container Deployed! [CTID: ${CTID}]                      ${CL}"
 echo -e "${GN}========================================================================${CL}"
 echo -e "Network Bridge:       ${BL}${MGMT_BR}${CL} (Reverse Proxy Backend Network)"
 echo -e "Container IP:         ${BL}${CT_IP}${CL}"
