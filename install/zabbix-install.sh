@@ -44,7 +44,9 @@ fi
 # 3. PostgreSQL Database Setup via Community Scripts built-in functions
 # ------------------------------------------------------------------------------
 PG_VERSION="17" setup_postgresql
-PG_DB_NAME="zabbixdb" PG_DB_USER="zabbix" PG_DB_PASS="$ZABBIX_PASS" setup_postgresql_db
+PG_DB_NAME="zabbixdb" PG_DB_USER="zabbix" PG_DB_PASS="$ZABBIX_PASS" PG_DB_SCHEMA_PERMS="true" setup_postgresql_db
+sudo -u postgres psql -d "$PG_DB_NAME" -c "ALTER SCHEMA public OWNER TO $PG_DB_USER;" &>/dev/null || true
+sudo -u postgres psql -d "$PG_DB_NAME" -c "GRANT ALL ON SCHEMA public TO $PG_DB_USER;" &>/dev/null || true
 
 # ------------------------------------------------------------------------------
 # 4. Version Detection (Zabbix 8.0+ minimum, newest available)
@@ -81,6 +83,7 @@ $STD apt-get install -y --no-install-recommends \
   zabbix-server-pgsql \
   zabbix-frontend-php \
   php-pgsql \
+  libapache2-mod-php \
   zabbix-apache-conf \
   zabbix-sql-scripts \
   zabbix-agent2 \
